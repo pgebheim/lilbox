@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .lilexe/
 state.db
+.rig/epics/
