@@ -1,0 +1,40 @@
+{
+  "$schema": "https://raw.githubusercontent.com/agent-rig/rig/main/rig.schema.json",
+  "project": {
+    "name": "lilexe",
+    "repo": "pgebheim/lilexe"
+  },
+  "runtime": {
+    "packageManager": "none"
+  },
+  "test": {
+    "command": "python3 -m py_compile bin/vm",
+    "requiresDatabase": false
+  },
+  "sourceScope": ["bin"],
+  "vcs": {
+    "defaultBranch": "main",
+    "baseRef": "origin/main",
+    "branchConvention": "{user}/{ticket}-{slug}",
+    "protectedBranchMergeQueue": false
+  },
+  "tracker": {
+    "provider": "github",
+    "team": "pgebheim",
+    "labelMapFile": ".claude/label-mapping.md",
+    "githubIntegration": true,
+    "shapeLabels": { "epic": "epic", "sprint": "sprint" }
+  },
+  "review": {
+    "patternsFile": ".claude/REVIEWER.md",
+    "bot": "none",
+    "maxRounds": 5
+  },
+  "agents": {
+    "debugger": "rig-debugger",
+    "reviewer": "rig-reviewer",
+    "architect": "rig-architect",
+    "qa": "rig-qa",
+    "coder": "rig-coder"
+  }
+}
