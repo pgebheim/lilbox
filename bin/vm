@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+"""
+vm - a lil exe.dev you run on your own box.
+
+Wraps microsandbox (libkrun microVMs) for isolated Linux boxes and Tailscale
+Serve/Funnel for publishing them, giving you the exe.dev experience -- "VMs, on
+your tailnet, quickly" -- on hardware you control.
+
+Stdlib only. State lives in ~/.lilexe/state.db (SQLite -- the GUTS ethos).
+"""
+
+import argparse
+import json
+import os
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+
+# --------------------------------------------------------------------------
+# Paths & constants
+# --------------------------------------------------------------------------
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(HOME, ".lilexe")
+DB_PATH = os.path.join(STATE_DIR, "state.db")
+
+DEFAULT_IMAGE = "python"
+DEFAULT_GUEST_PORT = 8000
+SERVE_PORT_BASE = 8443           # tailnet HTTPS ports we hand out (avoid 443 = caddy)
+SERVE_PORT_MAX = 8480
+FUNNEL_PORTS = {443, 8443, 10000}  # ports Tailscale Funnel is allowed to use
+
+
+# --------------------------------------------------------------------------
+# Pretty output
+# --------------------------------------------------------------------------
+
+_TTY = sys.stdout.isatty()
+
+
+def _c(code, s):
+    return f"\033[{code}m{s}\033[0m" if _TTY else s
+
+
+def bold(s):
+    return _c("1", s)
+
+
+def dim(s):
+    return _c("2", s)
+
+
+def green(s):
+    return _c("0;32", s)
+
+
+def cyan(s):
+    return _c("0;36", s)
+
+
+def red(s):
+    return _c("0;31", s)
+
+
+def yellow(s):
+    return _c("0;33", s)
+
+
+def info(msg):
+    print(f"{cyan('•')} {msg}")
+
+
+def ok(msg):
+    print(f"{green('✓')} {msg}")
+
+
+def warn(msg):
+    print(f"{yellow('!')} {msg}", file=sys.stderr)
+
+
+def die(msg, code=1):
+    print(f"{red('✗')} {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------
+# Locating msb / tailscale
+# --------------------------------------------------------------------------
+
+def find_msb():
+    for cand in (
+        shutil.which("msb"),
+        os.path.join(HOME, ".local/bin/msb"),
+        os.path.join(HOME, ".microsandbox/bin/msb"),
+    ):
+        if cand and os.path.exists(cand):
+            return cand
+    die("microsandbox (msb) not found. "
+        "Install: curl -fsSL https://install.microsandbox.dev | sh")
+
+
+def find_tailscale():
+    for cand in (shutil.which("tailscale"), "/usr/bin/tailscale"):
+        if cand and os.path.exists(cand):
+            return cand
+    return None  # publishing features degrade gracefully
+
+
+MSB = None
+TS = None
+
+
+# --------------------------------------------------------------------------
+# Subprocess helpers
+# --------------------------------------------------------------------------
+
+def run(cmd, capture=True, check=False):
+    """Run a command; return (rc, stdout, stderr)."""
+    p = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        text=True,
+    )
+    if check and p.returncode != 0:
+        err = (p.stderr or "").strip() if capture else ""
+        die(f"command failed ({' '.join(cmd)}): {err}")
+    return p.returncode, (p.stdout or ""), (p.stderr or "")
+
+
+def msb(*args, capture=True, check=False):
+    return run([MSB, *args], capture=capture, check=check)
+
+
+def exec_replace(cmd):
+    """Hand the terminal fully to an interactive command (ssh/exec shells)."""
+    os.execvp(cmd[0], cmd)
+
+
+# --------------------------------------------------------------------------
+# State (SQLite)
+# --------------------------------------------------------------------------
+
+def db():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS boxes(
+            name       TEXT PRIMARY KEY,
+            image      TEXT NOT NULL,
+            guest_port INTEGER,
+            host_port  INTEGER,
+            serve_port INTEGER,
+            public     INTEGER DEFAULT 0,
+            url        TEXT,
+            created    TEXT,
+            comment    TEXT
+        )
+        """
+    )
+    return con
+
+
+def get_box(con, name):
+    return con.execute("SELECT * FROM boxes WHERE name=?", (name,)).fetchone()
+
+
+def require_box(con, name):
+    row = get_box(con, name)
+    if not row:
+        die(f"no box named '{name}' (see: vm ls)")
+    return row
+
+
+# --------------------------------------------------------------------------
+# Tailscale helpers
+# --------------------------------------------------------------------------
+
+def tailnet_host():
+    """This node's MagicDNS name, e.g. nami.taile464ba.ts.net."""
+    if not TS:
+        return None
+    rc, out, _ = run([TS, "status", "--json"])
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out).get("Self", {}).get("DNSName", "").rstrip(".") or None
+    except Exception:
+        return None
+
+
+def serve_ports_in_use():
+    """Ports already claimed in `tailscale serve status`."""
+    used = set()
+    if not TS:
+        return used
+    rc, out, _ = run([TS, "serve", "status", "--json"])
+    if rc == 0 and out.strip():
+        try:
+            cfg = json.loads(out)
+            for key in ("TCP", "Web"):
+                for k in (cfg.get(key) or {}):
+                    # Web keys look like "nami....ts.net:8443"; TCP keys are ints.
+                    port = str(k).rsplit(":", 1)[-1]
+                    if port.isdigit():
+                        used.add(int(port))
+        except Exception:
+            pass
+    return used
+
+
+def alloc_serve_port(con, public):
+    used = serve_ports_in_use()
+    used |= {r[0] for r in con.execute(
+        "SELECT serve_port FROM boxes WHERE serve_port IS NOT NULL")}
+    if public:
+        # Funnel is restricted to a small allow-list of ports.
+        for p in (8443, 10000, 443):
+            if p not in used:
+                return p
+        die("all Funnel-capable ports (443/8443/10000) are in use")
+    for p in range(SERVE_PORT_BASE, SERVE_PORT_MAX + 1):
+        if p not in used:
+            return p
+    die(f"no free tailnet HTTPS port in {SERVE_PORT_BASE}-{SERVE_PORT_MAX}")
+
+
+# --------------------------------------------------------------------------
+# Host port allocation
+# --------------------------------------------------------------------------
+
+def alloc_host_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+# --------------------------------------------------------------------------
+# Live status from msb
+# --------------------------------------------------------------------------
+
+def live_status():
+    """Map of sandbox name -> status string, from `msb ls`."""
+    rc, out, _ = msb("ls")
+    status = {}
+    if rc != 0:
+        return status
+    for line in out.strip().splitlines()[1:]:  # skip header
+        parts = line.split()
+        if len(parts) >= 3:
+            status[parts[0]] = parts[2]
+    return status
+
+
+# --------------------------------------------------------------------------
+# argv splitting for `-- CMD` passthrough
+# --------------------------------------------------------------------------
+
+def split_ddash(argv):
+    """Split at the first standalone '--'. Returns (before, after|None)."""
+    if "--" in argv:
+        i = argv.index("--")
+        return argv[:i], argv[i + 1:]
+    return argv, None
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def cmd_new(args):
+    con = db()
+    name = args.name
+    if name and get_box(con, name):
+        die(f"box '{name}' already exists")
+
+    host_port = alloc_host_port()
+    guest_port = args.port
+    create = ["create", "--net", "public", "--port", f"{host_port}:{guest_port}"]
+    if name:
+        create += ["--name", name]
+    if args.cpus:
+        create += ["--cpus", str(args.cpus)]
+    if args.memory:
+        create += ["--memory", args.memory]
+    create.append(args.image)
+
+    info(f"booting {bold(args.image)} microVM"
+         + (f" as {bold(name)}" if name else "") + " …")
+    rc, out, err = msb(*create)
+    if rc != 0:
+        die(f"microsandbox create failed: {err.strip() or out.strip()}")
+
+    # msb auto-generates a name when --name is omitted; discover it.
+    if not name:
+        known = {r["name"] for r in con.execute("SELECT name FROM boxes")}
+        for n in live_status():
+            if n not in known:
+                name = n
+                break
+        if not name:
+            die("created a box but could not determine its name (see: msb ls)")
+
+    con.execute(
+        "INSERT OR REPLACE INTO boxes(name,image,guest_port,host_port,created) "
+        "VALUES(?,?,?,?,?)",
+        (name, args.image, guest_port, host_port,
+         time.strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    con.commit()
+    ok(f"box {bold(name)} is up ({args.image}, guest :{guest_port})")
+    print(dim(f"  vm exec {name} -- <cmd>     run a command"))
+    print(dim(f"  vm ssh {name}               open a shell"))
+    print(dim(f"  vm expose {name}            publish :{guest_port} to your tailnet"))
+
+
+def cmd_ls(args):
+    con = db()
+    rows = con.execute("SELECT * FROM boxes ORDER BY created").fetchall()
+    status = live_status()
+    if not rows:
+        print(dim("no boxes yet — create one with:  vm new"))
+        return
+    name_w = max(4, max(len(r["name"]) for r in rows))
+    img_w = max(5, max(len(r["image"]) for r in rows))
+    print(bold(f"{'NAME':<{name_w}}  {'IMAGE':<{img_w}}  {'STATUS':<9}  URL"))
+    for r in rows:
+        st = status.get(r["name"], "gone")
+        st_c = green(st) if st == "running" else (
+            yellow(st) if st == "stopped" else red(st))
+        url = r["url"] or dim("—")
+        print(f"{r['name']:<{name_w}}  {r['image']:<{img_w}}  "
+              f"{st_c}{' ' * max(0, 9 - len(st))}  {url}")
+
+
+def cmd_exec(args):
+    con = db()
+    require_box(con, args.name)
+    if not args.cmd:
+        die("nothing to run — usage: vm exec NAME -- <cmd>")
+    tty = ["--tty"] if (sys.stdin.isatty() and sys.stdout.isatty()) else []
+    exec_replace([MSB, "exec", *tty, args.name, "--", *args.cmd])
+
+
+def cmd_ssh(args):
+    con = db()
+    require_box(con, args.name)
+    cmd = [MSB, "ssh", args.name]
+    if args.cmd:
+        cmd += ["--", *args.cmd]
+    exec_replace(cmd)
+
+
+def cmd_run(args):
+    # Ephemeral: boot, run, discard. No state row.
+    cmd = [MSB, "run", args.image]
+    if args.cmd:
+        cmd += ["--", *args.cmd]
+    exec_replace(cmd)
+
+
+def cmd_expose(args):
+    if not TS:
+        die("tailscale not found — cannot publish")
+    con = db()
+    row = require_box(con, args.name)
+    if row["host_port"] is None:
+        die(f"box '{args.name}' has no published port "
+            f"(recreate with: vm new {args.name} --port <guest-port>)")
+    if row["serve_port"]:
+        info(f"already exposed at {cyan(row['url'])}")
+        return
+
+    public = args.public
+    serve_port = alloc_serve_port(con, public)
+    verb = "funnel" if public else "serve"
+    target = f"http://127.0.0.1:{row['host_port']}"
+    rc, out, err = run([TS, verb, "--bg", f"--https={serve_port}", target])
+    if rc != 0:
+        die(f"tailscale {verb} failed: {err.strip() or out.strip()}")
+
+    host = tailnet_host() or "this-host"
+    port_suffix = "" if (public and serve_port == 443) else f":{serve_port}"
+    url = f"https://{host}{port_suffix}/"
+    con.execute(
+        "UPDATE boxes SET serve_port=?, public=?, url=? WHERE name=?",
+        (serve_port, 1 if public else 0, url, args.name),
+    )
+    con.commit()
+    scope = "publicly on the internet" if public else "on your tailnet"
+    ok(f"{bold(args.name)} is live {scope}:")
+    print(f"    {cyan(url)}")
+
+
+def cmd_unexpose(args):
+    con = db()
+    row = require_box(con, args.name)
+    if not row["serve_port"]:
+        info(f"'{args.name}' is not exposed")
+        return
+    if TS:
+        verb = "funnel" if row["public"] else "serve"
+        run([TS, verb, f"--https={row['serve_port']}", "off"])
+    con.execute(
+        "UPDATE boxes SET serve_port=NULL, public=0, url=NULL WHERE name=?",
+        (args.name,),
+    )
+    con.commit()
+    ok(f"unpublished {bold(args.name)}")
+
+
+def _lifecycle(name, action):
+    con = db()
+    require_box(con, name)
+    rc, out, err = msb(action, name)
+    if rc != 0:
+        die(f"msb {action} failed: {err.strip() or out.strip()}")
+    ok(f"{action}ed {bold(name)}")
+
+
+def cmd_stop(args):
+    _lifecycle(args.name, "stop")
+
+
+def cmd_start(args):
+    _lifecycle(args.name, "start")
+
+
+def cmd_restart(args):
+    _lifecycle(args.name, "restart")
+
+
+def cmd_rm(args):
+    con = db()
+    row = require_box(con, args.name)
+    if row["serve_port"] and TS:
+        verb = "funnel" if row["public"] else "serve"
+        run([TS, verb, f"--https={row['serve_port']}", "off"])
+    msb("stop", args.name)  # best effort
+    rc, out, err = msb("rm", args.name)
+    if rc != 0 and "not found" not in (err + out).lower():
+        warn(f"msb rm reported: {err.strip() or out.strip()}")
+    con.execute("DELETE FROM boxes WHERE name=?", (args.name,))
+    con.commit()
+    ok(f"removed {bold(args.name)}")
+
+
+def cmd_fork(args):
+    """Snapshot a box and boot a clone from it (experimental)."""
+    con = db()
+    src = require_box(con, args.name)
+    new = args.newname or f"{args.name}-fork"
+    if get_box(con, new):
+        die(f"box '{new}' already exists")
+    snap = f"lilexe-{args.name}-{int(time.time())}"
+
+    was_running = live_status().get(args.name) == "running"
+    info(f"snapshotting {bold(args.name)} (stopping it briefly) …")
+    msb("stop", args.name)
+    rc, out, err = msb("snapshot", "create", "--from", args.name, snap)
+    if rc != 0:
+        if was_running:
+            msb("start", args.name)
+        die(f"snapshot failed: {err.strip() or out.strip()}")
+    if was_running:
+        msb("start", args.name)
+
+    host_port = alloc_host_port()
+    info(f"booting clone {bold(new)} from snapshot …")
+    rc, out, err = msb(
+        "run", "--from-snapshot", snap, "--name", new, "-d",
+        "--net", "public", "--port", f"{host_port}:{src['guest_port']}",
+    )
+    if rc != 0:
+        die(f"clone boot failed: {err.strip() or out.strip()}")
+    con.execute(
+        "INSERT INTO boxes(name,image,guest_port,host_port,created,comment) "
+        "VALUES(?,?,?,?,?,?)",
+        (new, src["image"], src["guest_port"], host_port,
+         time.strftime("%Y-%m-%d %H:%M:%S"), f"forked from {args.name}"),
+    )
+    con.commit()
+    ok(f"forked {bold(args.name)} → {bold(new)}")
+
+
+def cmd_stat(args):
+    con = db()
+    require_box(con, args.name)
+    exec_replace([MSB, "inspect", args.name])
+
+
+def cmd_url(args):
+    con = db()
+    row = require_box(con, args.name)
+    if row["url"]:
+        print(row["url"])
+    else:
+        die(f"'{args.name}' is not exposed (vm expose {args.name})")
+
+
+def cmd_doctor(args):
+    print(bold("lilexe doctor"))
+    print(f"  msb:        {MSB}")
+    print(f"  tailscale:  {TS or red('not found')}")
+    print(f"  state db:   {DB_PATH}")
+    print(f"  tailnet:    {tailnet_host() or dim('unknown')}")
+    print()
+    info("microsandbox host check:")
+    sys.stdout.flush()  # keep our prints ahead of the subprocess output
+    msb("doctor", capture=False)
+
+
+# --------------------------------------------------------------------------
+# Parser
+# --------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="vm",
+        description="a lil exe.dev you run yourself — microVMs on your tailnet",
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    n = sub.add_parser("new", help="create a new box (persistent microVM)")
+    n.add_argument("name", nargs="?", help="box name (auto-generated if omitted)")
+    n.add_argument("--image", default=DEFAULT_IMAGE,
+                   help=f"image (default: {DEFAULT_IMAGE})")
+    n.add_argument("--port", type=int, default=DEFAULT_GUEST_PORT,
+                   help=f"guest web port to publish (default: {DEFAULT_GUEST_PORT})")
+    n.add_argument("--cpus", type=int, help="vCPUs")
+    n.add_argument("--memory", help="memory, e.g. 1G")
+    n.set_defaults(func=cmd_new)
+
+    l = sub.add_parser("ls", help="list boxes")
+    l.set_defaults(func=cmd_ls)
+
+    e = sub.add_parser("exec", help="run a command in a box  (vm exec NAME -- cmd)")
+    e.add_argument("name")
+    e.set_defaults(func=cmd_exec)
+
+    s = sub.add_parser("ssh", help="open a shell in a box")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_ssh)
+
+    r = sub.add_parser("run", help="ephemeral box: boot, run, discard")
+    r.add_argument("--image", default=DEFAULT_IMAGE)
+    r.set_defaults(func=cmd_run)
+
+    x = sub.add_parser("expose", help="publish a box to your tailnet (HTTPS)")
+    x.add_argument("name")
+    x.add_argument("--public", action="store_true",
+                   help="expose to the public internet via Tailscale Funnel")
+    x.set_defaults(func=cmd_expose)
+
+    u = sub.add_parser("unexpose", help="stop publishing a box")
+    u.add_argument("name")
+    u.set_defaults(func=cmd_unexpose)
+
+    for verb, fn, helptxt in (
+        ("stop", cmd_stop, "stop a running box"),
+        ("start", cmd_start, "start a stopped box"),
+        ("restart", cmd_restart, "restart a box"),
+        ("rm", cmd_rm, "remove a box (and unpublish it)"),
+        ("stat", cmd_stat, "show detailed box info"),
+    ):
+        sp = sub.add_parser(verb, help=helptxt)
+        sp.add_argument("name")
+        sp.set_defaults(func=fn)
+
+    f = sub.add_parser("fork", help="snapshot a box and boot a clone (experimental)")
+    f.add_argument("name")
+    f.add_argument("newname", nargs="?")
+    f.set_defaults(func=cmd_fork)
+
+    ur = sub.add_parser("url", help="print a box's published URL")
+    ur.add_argument("name")
+    ur.set_defaults(func=cmd_url)
+
+    d = sub.add_parser("doctor", help="check the local runtime")
+    d.set_defaults(func=cmd_doctor)
+
+    return p
+
+
+def main():
+    global MSB, TS
+    MSB = find_msb()
+    TS = find_tailscale()
+
+    argv = sys.argv[1:]
+    # Commands that take a passthrough command after `--`.
+    passthrough = {"exec", "ssh", "run"}
+    parser = build_parser()
+    if argv and argv[0] in passthrough:
+        before, after = split_ddash(argv)
+        ns = parser.parse_args(before)
+        ns.cmd = after or []
+        ns.func(ns)
+        return
+
+    ns = parser.parse_args(argv)
+    ns.func(ns)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
