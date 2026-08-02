@@ -39,6 +39,8 @@ USER_TEMPLATES = os.path.join(STATE_DIR, "templates")
 REPO_TEMPLATES = os.path.join(
     os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "templates")
 
+LOG_DIR = os.path.join(STATE_DIR, "logs")  # per-box provisioning logs
+
 
 # --------------------------------------------------------------------------
 # Pretty output
@@ -259,6 +261,39 @@ def list_templates():
     return [seen[k] for k in sorted(seen)]
 
 
+def provision(name, tmpl):
+    """Run a template's setup.sh inside a running box: copy it in, exec it,
+    log the output, and surface any failure (keeping the box for inspection).
+
+    Idempotency is the setup script's own contract (guard installs with
+    `command -v … ||`); this runner just runs it once and reports.
+    """
+    if not tmpl or not tmpl.get("setup"):
+        return
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_path = os.path.join(LOG_DIR, f"{name}-setup.log")
+    remote = "/tmp/lilexe-setup.sh"
+
+    info(f"provisioning {bold(name)} (template {tmpl['name']}) …")
+    rc, out, err = msb("copy", tmpl["setup"], f"{name}:{remote}")
+    if rc != 0:
+        die(f"could not copy setup script into '{name}': "
+            f"{err.strip() or out.strip()}")
+
+    rc, out, err = msb("exec", name, "--", "/bin/sh", remote)
+    combined = (out or "") + (err or "")
+    with open(log_path, "w") as f:
+        f.write(combined)
+
+    if rc != 0:
+        warn(f"provisioning of '{name}' failed (rc={rc}) — box kept for inspection")
+        tail = "\n".join(combined.strip().splitlines()[-8:])
+        if tail:
+            print(dim(tail), file=sys.stderr)
+        die(f"setup failed for '{name}' (full log: {log_path})")
+    ok(f"provisioned {bold(name)} (log: {log_path})")
+
+
 # --------------------------------------------------------------------------
 # Tailscale helpers
 # --------------------------------------------------------------------------
@@ -407,9 +442,26 @@ def cmd_new(args):
     )
     con.commit()
     ok(f"box {bold(name)} is up ({image}, guest :{guest_port})")
+
+    # Post-boot provisioning: run the template's setup script (if any). The box
+    # is already booted and reachable via msb exec, so this runs immediately.
+    provision(name, tmpl)
+
     print(dim(f"  vm exec {name} -- <cmd>     run a command"))
     print(dim(f"  vm ssh {name}               open a shell"))
     print(dim(f"  vm expose {name}            publish :{guest_port} to your tailnet"))
+
+
+def cmd_provision(args):
+    con = db()
+    row = require_box(con, args.name)
+    if not row["template"]:
+        die(f"box '{args.name}' was not created from a template — nothing to run")
+    tmpl = load_template(row["template"])
+    if not tmpl.get("setup"):
+        info(f"template '{tmpl['name']}' has no setup script — nothing to run")
+        return
+    provision(args.name, tmpl)
 
 
 def cmd_ls(args):
@@ -652,6 +704,10 @@ def build_parser():
 
     tm = sub.add_parser("templates", help="list available box templates")
     tm.set_defaults(func=cmd_templates)
+
+    pv = sub.add_parser("provision", help="re-run a box's template setup script")
+    pv.add_argument("name")
+    pv.set_defaults(func=cmd_provision)
 
     e = sub.add_parser("exec", help="run a command in a box  (vm exec NAME -- cmd)")
     e.add_argument("name")
