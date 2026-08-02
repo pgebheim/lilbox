@@ -306,7 +306,12 @@ def cmd_new(args):
     if get_box(con, name):
         die(f"box '{name}' already exists")
 
-    volume = None if args.no_persist else volume_name_for(name)
+    # Persist by default. --no-persist opts out; --volume attaches a specific
+    # existing volume (e.g. one kept via `vm rm --keep-data`).
+    if args.no_persist:
+        volume = None
+    else:
+        volume = args.volume or volume_name_for(name)
 
     host_port = alloc_host_port()
     guest_port = args.port
@@ -470,7 +475,20 @@ def cmd_rm(args):
         warn(f"msb rm reported: {err.strip() or out.strip()}")
     con.execute("DELETE FROM boxes WHERE name=?", (args.name,))
     con.commit()
-    ok(f"removed {bold(args.name)}")
+
+    # By default rm also deletes the box's home volume (its data). --keep-data
+    # preserves it so a future box of the same name re-attaches it.
+    vol = row["volume"]
+    if vol and args.keep_data:
+        ok(f"removed {bold(args.name)} — kept volume {cyan(vol)}")
+        print(dim(f"  vm new {args.name}   re-attaches it"))
+    elif vol:
+        rc, out, err = msb("volume", "remove", vol)
+        if rc != 0 and "not found" not in (err + out).lower():
+            warn(f"could not remove volume {vol}: {err.strip() or out.strip()}")
+        ok(f"removed {bold(args.name)} (and its home volume)")
+    else:
+        ok(f"removed {bold(args.name)}")
 
 
 def cmd_fork(args):
@@ -545,6 +563,42 @@ def cmd_rebuild(args):
     ok(f"rebuilt {bold(name)} on {new_image} (home data intact)")
 
 
+def _human_bytes(n):
+    if not isinstance(n, int):
+        return "—"
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024:
+            return f"{n}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}P"
+
+
+def cmd_volumes(args):
+    con = db()
+    rc, out, _ = msb("volume", "list", "--format", "json")
+    vols = []
+    if rc == 0 and out.strip():
+        try:
+            vols = json.loads(out)
+        except Exception:
+            vols = []
+    # Which box owns each volume (a volume with no owning row is an orphan —
+    # e.g. left behind by `vm rm --keep-data`).
+    owner = {r["volume"]: r["name"] for r in con.execute(
+        "SELECT name, volume FROM boxes WHERE volume IS NOT NULL")}
+    rows = [v for v in vols if str(v.get("name", "")).startswith("lilexe-")]
+    if not rows:
+        print(dim("no lilexe volumes yet — `vm new` creates one per box"))
+        return
+    name_w = max(6, max(len(v["name"]) for v in rows))
+    print(bold(f"{'VOLUME':<{name_w}}  {'BOX':<14}  USED"))
+    for v in sorted(rows, key=lambda v: v["name"]):
+        vn = v["name"]
+        box = owner.get(vn) or red("orphan")
+        pad = " " * max(0, 14 - len(box if owner.get(vn) else "orphan"))
+        print(f"{vn:<{name_w}}  {box}{pad}  {_human_bytes(v.get('used_bytes'))}")
+
+
 def cmd_stat(args):
     con = db()
     require_box(con, args.name)
@@ -593,6 +647,8 @@ def build_parser():
     n.add_argument("--memory", help="memory, e.g. 1G")
     n.add_argument("--no-persist", action="store_true",
                    help="don't attach a persistent home volume (ephemeral home)")
+    n.add_argument("--volume",
+                   help="attach a specific existing volume (e.g. one kept via rm --keep-data)")
     n.set_defaults(func=cmd_new)
 
     l = sub.add_parser("ls", help="list boxes")
@@ -624,12 +680,20 @@ def build_parser():
         ("stop", cmd_stop, "stop a running box"),
         ("start", cmd_start, "start a stopped box"),
         ("restart", cmd_restart, "restart a box"),
-        ("rm", cmd_rm, "remove a box (and unpublish it)"),
         ("stat", cmd_stat, "show detailed box info"),
     ):
         sp = sub.add_parser(verb, help=helptxt)
         sp.add_argument("name")
         sp.set_defaults(func=fn)
+
+    rmp = sub.add_parser("rm", help="remove a box (unpublish + delete its home volume)")
+    rmp.add_argument("name")
+    rmp.add_argument("--keep-data", action="store_true",
+                     help="preserve the box's home volume (default: delete it)")
+    rmp.set_defaults(func=cmd_rm)
+
+    vol = sub.add_parser("volumes", help="list persistent home volumes")
+    vol.set_defaults(func=cmd_volumes)
 
     f = sub.add_parser("fork", help="snapshot a box and boot a clone (experimental)")
     f.add_argument("name")
