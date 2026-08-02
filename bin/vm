@@ -511,6 +511,40 @@ def cmd_fork(args):
     ok(f"forked {bold(args.name)} → {bold(new)}")
 
 
+def cmd_rebuild(args):
+    con = db()
+    row = require_box(con, args.name)
+    if not row["volume"]:
+        die(f"box '{args.name}' has no persistent volume — nothing to preserve "
+            f"across a rebuild. (Recreate it with: vm new {args.name})")
+    name = args.name
+    new_image = args.image or row["image"]
+
+    info(f"rebuilding {bold(name)} on {bold(new_image)} "
+         f"(home volume {row['volume']} preserved) …")
+    # Tear down the box but KEEP its volume (msb rm does not touch volumes).
+    msb("stop", name)  # best effort
+    rc, out, err = msb("rm", name)
+    if rc != 0 and "not found" not in (err + out).lower():
+        die(f"could not remove the old box: {err.strip() or out.strip()}")
+
+    # Recreate with the SAME name, host port, and volume — new image. Reusing
+    # host_port keeps any existing `vm expose` mapping valid.
+    create = ["create", "--net", "public",
+              "--port", f"{row['host_port']}:{row['guest_port']}", "--name", name,
+              "--mount-named", f"{row['volume']}:{DEFAULT_HOME}", new_image]
+    rc, out, err = msb(*create)
+    if rc != 0:
+        # The box row still records the old image, so a bare retry re-boots it.
+        die(f"rebuild failed to boot the new box — your data is safe in volume "
+            f"{row['volume']}. Retry with: vm rebuild {name}\n  "
+            f"{err.strip() or out.strip()}")
+
+    con.execute("UPDATE boxes SET image=? WHERE name=?", (new_image, name))
+    con.commit()
+    ok(f"rebuilt {bold(name)} on {new_image} (home data intact)")
+
+
 def cmd_stat(args):
     con = db()
     require_box(con, args.name)
@@ -601,6 +635,12 @@ def build_parser():
     f.add_argument("name")
     f.add_argument("newname", nargs="?")
     f.set_defaults(func=cmd_fork)
+
+    rb = sub.add_parser("rebuild",
+                        help="recreate a box on a new/updated image, keeping its home volume")
+    rb.add_argument("name")
+    rb.add_argument("--image", help="new image (default: the box's current image)")
+    rb.set_defaults(func=cmd_rebuild)
 
     ur = sub.add_parser("url", help="print a box's published URL")
     ur.add_argument("name")
