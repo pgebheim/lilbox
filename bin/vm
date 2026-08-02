@@ -117,6 +117,10 @@ def find_tailscale():
     return None  # publishing features degrade gracefully
 
 
+def find_docker():
+    return shutil.which("docker")  # only needed to build Dockerfile templates
+
+
 MSB = None
 TS = None
 
@@ -261,6 +265,48 @@ def list_templates():
     return [seen[k] for k in sorted(seen)]
 
 
+def _image_cached(tag):
+    """Is `tag` already in msb's local image cache?"""
+    rc, out, _ = msb("image", "ls")
+    return rc == 0 and any(tag in line for line in out.splitlines())
+
+
+def build_template_image(tmpl, rebuild=False):
+    """Build a template's Dockerfile into an OCI image and load it into msb.
+
+    microsandbox has no native build, so we build with Docker and import the
+    result (`docker save | msb load`). Returns the local tag `lilexe/<name>`.
+    Skips the build if the tag is already cached (unless `rebuild`).
+    """
+    tag = f"lilexe/{tmpl['name']}:latest"
+    if not rebuild and _image_cached(tag):
+        info(f"using cached image {bold(tag)}")
+        return tag
+
+    docker = find_docker()
+    if not docker:
+        die(f"template '{tmpl['name']}' builds from a Dockerfile, but `docker` "
+            f"was not found (needed to build it). Install Docker, or point the "
+            f"template at an --image / registry ref instead.")
+
+    info(f"building {bold(tag)} from {tmpl['name']}/Dockerfile …")
+    rc, out, err = run([docker, "build", "-t", tag, tmpl["dir"]], capture=False)
+    if rc != 0:
+        die(f"docker build failed for template '{tmpl['name']}'")
+
+    info(f"importing {bold(tag)} into microsandbox …")
+    saver = subprocess.Popen([docker, "save", tag], stdout=subprocess.PIPE)
+    loader = subprocess.Popen(
+        [MSB, "load", "-t", tag], stdin=saver.stdout,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    saver.stdout.close()  # let saver receive SIGPIPE if loader dies
+    _, lerr = loader.communicate()
+    saver.wait()
+    if saver.returncode != 0 or loader.returncode != 0:
+        die(f"failed to import '{tag}' into microsandbox: {(lerr or '').strip()}")
+    return tag
+
+
 def provision(name, tmpl):
     """Run a template's setup.sh inside a running box: copy it in, exec it,
     log the output, and surface any failure (keeping the box for inspection).
@@ -400,8 +446,16 @@ def cmd_new(args):
 
     tmpl = load_template(args.template) if args.template else None
 
-    # Precedence: explicit CLI flag > template value > built-in default.
-    image = args.image or (tmpl and tmpl["image"]) or DEFAULT_IMAGE
+    # Image precedence: CLI --image > template image > template Dockerfile build
+    # > built-in default. Other defaults: CLI flag > template > default.
+    if args.image:
+        image = args.image
+    elif tmpl and tmpl["image"]:
+        image = tmpl["image"]
+    elif tmpl and tmpl["dockerfile"]:
+        image = build_template_image(tmpl, rebuild=args.rebuild)
+    else:
+        image = DEFAULT_IMAGE
     guest_port = args.port or (tmpl and tmpl["port"]) or DEFAULT_GUEST_PORT
     cpus = args.cpus or (tmpl and tmpl["cpus"])
     memory = args.memory or (tmpl and tmpl["memory"])
@@ -697,6 +751,8 @@ def build_parser():
                         f"(default: {DEFAULT_GUEST_PORT}, or the template's)")
     n.add_argument("--cpus", type=int, help="vCPUs")
     n.add_argument("--memory", help="memory, e.g. 1G")
+    n.add_argument("--rebuild", action="store_true",
+                   help="rebuild a Dockerfile template's image (ignore the cache)")
     n.set_defaults(func=cmd_new)
 
     l = sub.add_parser("ls", help="list boxes")
