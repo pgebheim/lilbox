@@ -67,7 +67,9 @@ vm run -- python3 -c 'print("ran in a throwaway microVM")'
 
 | Command | Does |
 |---|---|
-| `vm new [NAME] [--image I] [--port P] [--cpus N] [--memory M]` | Boot a persistent box (default image `python`, publishes guest port `8000`) |
+| `vm new [NAME] [--template T] [--image I] [--port P] [--cpus N] [--memory M] [--rebuild]` | Boot a persistent box (default image `python`, publishes guest port `8000`) |
+| `vm templates` | List available box templates |
+| `vm provision NAME` | Re-run a box's template setup script |
 | `vm ls` | List boxes with live status + published URLs |
 | `vm exec NAME -- CMD…` | Run a command inside a box |
 | `vm ssh NAME [-- CMD]` | Interactive shell (or one-shot command) |
@@ -80,6 +82,35 @@ vm run -- python3 -c 'print("ran in a throwaway microVM")'
 | `vm rm NAME` | Remove a box (and unpublish it) |
 | `vm stat NAME` | Detailed box info |
 | `vm doctor` | Check msb + tailscale + tailnet |
+
+## Templates
+
+A **template** is a box that arrives useful — an image + defaults + an optional
+post-boot setup script. It's a directory `<name>/`:
+
+```
+<name>/
+  template.json      # image + defaults (cpus/memory/port) — JSON, stdlib-only
+  setup.sh           # optional: run inside the box after boot (idempotent)
+  Dockerfile         # optional: build the image locally instead of pulling
+```
+
+```bash
+vm templates                      # list templates (repo starters + your own)
+vm new dev --template python-dev   # boot from a template
+vm provision dev                   # re-run its setup (idempotent)
+```
+
+Resolution: user templates in `~/.lilexe/templates/` **override** repo starters
+in `templates/`. Precedence for values is **CLI flag > template > default**
+(`vm new --image alpine --template python-dev` boots alpine, keeping the
+template's other defaults). If a template has a `Dockerfile` (and no `image`),
+`vm new` builds it (`docker build` → `msb load`) and caches it; `--rebuild`
+forces a fresh build. `setup.sh` runs post-boot; a non-zero exit is surfaced and
+logged to `~/.lilexe/logs/<box>-setup.log` (the box is kept for inspection).
+
+Shipped starters: **`python-dev`** (python + git + uv) and **`node-dev`**
+(node + npm + git).
 
 ## How publishing works
 
