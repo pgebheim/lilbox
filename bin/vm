@@ -276,7 +276,7 @@ def split_ddash(argv):
 # --------------------------------------------------------------------------
 
 def build_create_args(name, host_port, guest_port, image, cpus=None, memory=None,
-                      mount_dir=None, workdir=None, secret=None):
+                      mount_dir=None, workdir=None, secret=None, env=None):
     """Assemble the `msb create` argv (shared by `vm new` and `vm agent`)."""
     argv = ["create", "--net", "public", "--port", f"{host_port}:{guest_port}"]
     if name:
@@ -285,6 +285,8 @@ def build_create_args(name, host_port, guest_port, image, cpus=None, memory=None
         argv += ["--mount-dir", mount_dir]
     if workdir:
         argv += ["-w", workdir]
+    for kv in (env or []):
+        argv += ["-e", kv]
     if secret:
         # msb injects the secret into outbound TLS to the allow-listed host only;
         # it never lands in the guest env, the image, or our state db.
@@ -390,10 +392,22 @@ def cmd_agent(args):
 
     workspace = _resolve_workspace(args)
 
+    # BYO-key injection. The real key is read from the host env var and injected
+    # by msb only into outbound TLS to the allow-listed host — it never lands in
+    # the guest env, the image, or our state db. The guest env holds only msb's
+    # placeholder ($MSB_<ENV>) so the agent emits a request msb can rewrite.
+    env, secret = [], None
+    if os.environ.get(args.key_env):
+        env.append(f"{args.key_env}=$MSB_{args.key_env}")
+        secret = f"{args.key_env}@{args.key_host}"
+    else:
+        warn(f"{args.key_env} is not set on the host — the box boots, but the "
+             f"agent can't authenticate until you export {args.key_env}.")
+
     host_port = alloc_host_port()
     create = build_create_args(name, host_port, DEFAULT_GUEST_PORT, args.image,
                                mount_dir=f"{workspace}:{AGENT_WORKDIR}",
-                               workdir=AGENT_WORKDIR)
+                               workdir=AGENT_WORKDIR, env=env, secret=secret)
     info(f"booting agent box"
          + (f" {bold(name)}" if name else "")
          + f" ({args.image}, workspace {dim(workspace)}) …")
@@ -419,6 +433,19 @@ def cmd_agent(args):
     con.commit()
 
     _install_agent(name)
+
+    # AGENTS.md passthrough: copy an explicit --agents-file into /workspace so
+    # the agent reads it. (A workspace that already ships AGENTS.md needs none.)
+    if args.agents_file:
+        if not os.path.isfile(args.agents_file):
+            die(f"AGENTS.md not found: {args.agents_file}")
+        rc, out, err = msb("copy", os.path.abspath(args.agents_file),
+                           f"{name}:{AGENT_WORKDIR}/AGENTS.md")
+        if rc != 0:
+            warn(f"could not pass AGENTS.md: {err.strip() or out.strip()}")
+        else:
+            info(f"passed {os.path.basename(args.agents_file)} → {AGENT_WORKDIR}/AGENTS.md")
+
     ok(f"agent box {bold(name)} ready (workspace mounted at {AGENT_WORKDIR})")
 
     task = " ".join(args.cmd) if args.cmd else None
@@ -710,6 +737,12 @@ def build_parser():
                        help="host dir to mount at /workspace (default: current dir)")
     ag_ws.add_argument("--clone", metavar="URL",
                        help="git clone URL into ~/.lilexe/workspaces/ and mount that")
+    ag.add_argument("--agents-file", metavar="PATH",
+                    help="copy an AGENTS.md into the box's /workspace")
+    ag.add_argument("--key-env", default="ANTHROPIC_API_KEY",
+                    help="host env var holding the agent's API key (default: ANTHROPIC_API_KEY)")
+    ag.add_argument("--key-host", default="api.anthropic.com",
+                    help="host the injected key may be sent to (default: api.anthropic.com)")
     ag.set_defaults(func=cmd_agent)
 
     d = sub.add_parser("doctor", help="check the local runtime")
