@@ -91,6 +91,22 @@ setup. `--public` swaps `serve` for `funnel` (443/8443/10000 only) to reach the
 open internet. State (name → image → host port → serve port → URL) lives in
 `~/.lilexe/state.db`.
 
+## Boxes with Tailscale baked in (`lilexe-box`)
+
+The default images (`python`, `alpine`, …) are published from the *host* via
+`tailscale serve`. The [`lilexe-box`](images/lilexe-box/) image instead bakes
+`tailscale` + `tailscaled` and a first-boot bring-up hook *into the box*, so it
+can join your tailnet as its own node — the foundation for per-box hostnames,
+keyless `vm ssh`, and identity-based auth (epic #2).
+
+```bash
+images/lilexe-box/build.sh          # docker build -> msb load as `lilexe-box`
+vm new mybox --image lilexe-box     # boot it
+vm exec mybox -- tailscale version  # tailscale is baked in
+```
+
+See [`images/lilexe-box/README.md`](images/lilexe-box/README.md) for details.
+
 ## What this POC does *not* do (yet)
 
 - **No auth on published endpoints** beyond what your tailnet already enforces.
