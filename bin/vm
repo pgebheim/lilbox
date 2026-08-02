@@ -33,6 +33,12 @@ SERVE_PORT_BASE = 8443           # tailnet HTTPS ports we hand out (avoid 443 = 
 SERVE_PORT_MAX = 8480
 FUNNEL_PORTS = {443, 8443, 10000}  # ports Tailscale Funnel is allowed to use
 
+# Templates: a directory <name>/ with template.json (+ optional setup.sh /
+# Dockerfile). User templates win over repo-shipped starters.
+USER_TEMPLATES = os.path.join(STATE_DIR, "templates")
+REPO_TEMPLATES = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "templates")
+
 
 # --------------------------------------------------------------------------
 # Pretty output
@@ -159,10 +165,15 @@ def db():
             public     INTEGER DEFAULT 0,
             url        TEXT,
             created    TEXT,
-            comment    TEXT
+            comment    TEXT,
+            template   TEXT
         )
         """
     )
+    # Migrate pre-existing DBs that predate the `template` column.
+    cols = {r[1] for r in con.execute("PRAGMA table_info(boxes)")}
+    if "template" not in cols:
+        con.execute("ALTER TABLE boxes ADD COLUMN template TEXT")
     return con
 
 
@@ -175,6 +186,77 @@ def require_box(con, name):
     if not row:
         die(f"no box named '{name}' (see: vm ls)")
     return row
+
+
+# --------------------------------------------------------------------------
+# Templates
+# --------------------------------------------------------------------------
+
+def _valid_template_name(name):
+    """A template name is a single path segment — no traversal, no separators."""
+    return bool(name) and name not in (".", "..") \
+        and "/" not in name and os.sep not in name and "\0" not in name
+
+
+def _read_manifest(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception as e:
+        die(f"invalid template.json ({path}): {e}")
+
+
+def load_template(name):
+    """Resolve a template by name. User templates win over repo starters.
+
+    Returns a dict: name, source ('user'|'builtin'), dir, image, cpus, memory,
+    port, description, setup (path|None), dockerfile (path|None). Dies if the
+    template can't be found or its manifest is malformed.
+    """
+    if not _valid_template_name(name):
+        die(f"invalid template name '{name}'")
+    for source, base in (("user", USER_TEMPLATES), ("builtin", REPO_TEMPLATES)):
+        d = os.path.join(base, name)
+        manifest = os.path.join(d, "template.json")
+        if os.path.isfile(manifest):
+            data = _read_manifest(manifest)
+            setup = os.path.join(d, "setup.sh")
+            dockerfile = os.path.join(d, "Dockerfile")
+            return {
+                "name": name,
+                "source": source,
+                "dir": d,
+                "image": data.get("image"),
+                "cpus": data.get("cpus"),
+                "memory": data.get("memory"),
+                "port": data.get("port"),
+                "description": data.get("description", ""),
+                "setup": setup if os.path.isfile(setup) else None,
+                "dockerfile": dockerfile if os.path.isfile(dockerfile) else None,
+            }
+    die(f"no template named '{name}' (see: vm templates)")
+
+
+def list_templates():
+    """Every template across both dirs, user shadowing builtin, sorted by name."""
+    seen = {}
+    for source, base in (("user", USER_TEMPLATES), ("builtin", REPO_TEMPLATES)):
+        if not os.path.isdir(base):
+            continue
+        for entry in sorted(os.listdir(base)):
+            if entry in seen:
+                continue
+            manifest = os.path.join(base, entry, "template.json")
+            if not os.path.isfile(manifest):
+                continue
+            data = _read_manifest(manifest)
+            seen[entry] = {
+                "name": entry,
+                "source": source,
+                "image": data.get("image") or "?",
+                "description": data.get("description", ""),
+            }
+    return [seen[k] for k in sorted(seen)]
 
 
 # --------------------------------------------------------------------------
@@ -281,18 +363,26 @@ def cmd_new(args):
     if name and get_box(con, name):
         die(f"box '{name}' already exists")
 
+    tmpl = load_template(args.template) if args.template else None
+
+    # Precedence: explicit CLI flag > template value > built-in default.
+    image = args.image or (tmpl and tmpl["image"]) or DEFAULT_IMAGE
+    guest_port = args.port or (tmpl and tmpl["port"]) or DEFAULT_GUEST_PORT
+    cpus = args.cpus or (tmpl and tmpl["cpus"])
+    memory = args.memory or (tmpl and tmpl["memory"])
+
     host_port = alloc_host_port()
-    guest_port = args.port
     create = ["create", "--net", "public", "--port", f"{host_port}:{guest_port}"]
     if name:
         create += ["--name", name]
-    if args.cpus:
-        create += ["--cpus", str(args.cpus)]
-    if args.memory:
-        create += ["--memory", args.memory]
-    create.append(args.image)
+    if cpus:
+        create += ["--cpus", str(cpus)]
+    if memory:
+        create += ["--memory", memory]
+    create.append(image)
 
-    info(f"booting {bold(args.image)} microVM"
+    label = bold(image) + (dim(f" via {tmpl['name']}") if tmpl else "")
+    info(f"booting {label} microVM"
          + (f" as {bold(name)}" if name else "") + " …")
     rc, out, err = msb(*create)
     if rc != 0:
@@ -309,13 +399,14 @@ def cmd_new(args):
             die("created a box but could not determine its name (see: msb ls)")
 
     con.execute(
-        "INSERT OR REPLACE INTO boxes(name,image,guest_port,host_port,created) "
-        "VALUES(?,?,?,?,?)",
-        (name, args.image, guest_port, host_port,
-         time.strftime("%Y-%m-%d %H:%M:%S")),
+        "INSERT OR REPLACE INTO boxes"
+        "(name,image,guest_port,host_port,created,template) "
+        "VALUES(?,?,?,?,?,?)",
+        (name, image, guest_port, host_port,
+         time.strftime("%Y-%m-%d %H:%M:%S"), tmpl["name"] if tmpl else None),
     )
     con.commit()
-    ok(f"box {bold(name)} is up ({args.image}, guest :{guest_port})")
+    ok(f"box {bold(name)} is up ({image}, guest :{guest_port})")
     print(dim(f"  vm exec {name} -- <cmd>     run a command"))
     print(dim(f"  vm ssh {name}               open a shell"))
     print(dim(f"  vm expose {name}            publish :{guest_port} to your tailnet"))
@@ -505,6 +596,20 @@ def cmd_url(args):
         die(f"'{args.name}' is not exposed (vm expose {args.name})")
 
 
+def cmd_templates(args):
+    tmpls = list_templates()
+    if not tmpls:
+        print(dim("no templates yet — add one under ~/.lilexe/templates/<name>/"))
+        return
+    name_w = max(4, max(len(t["name"]) for t in tmpls))
+    img_w = max(5, max(len(t["image"]) for t in tmpls))
+    print(bold(f"{'NAME':<{name_w}}  {'IMAGE':<{img_w}}  {'SOURCE':<7}  DESCRIPTION"))
+    for t in tmpls:
+        desc = t["description"] or dim("—")
+        print(f"{t['name']:<{name_w}}  {t['image']:<{img_w}}  "
+              f"{t['source']:<7}  {desc}")
+
+
 def cmd_doctor(args):
     print(bold("lilexe doctor"))
     print(f"  msb:        {MSB}")
@@ -530,16 +635,23 @@ def build_parser():
 
     n = sub.add_parser("new", help="create a new box (persistent microVM)")
     n.add_argument("name", nargs="?", help="box name (auto-generated if omitted)")
-    n.add_argument("--image", default=DEFAULT_IMAGE,
-                   help=f"image (default: {DEFAULT_IMAGE})")
-    n.add_argument("--port", type=int, default=DEFAULT_GUEST_PORT,
-                   help=f"guest web port to publish (default: {DEFAULT_GUEST_PORT})")
+    n.add_argument("--template", help="boot from a template (see: vm templates)")
+    # Defaults are None so precedence resolves in cmd_new:
+    # CLI flag > template value > built-in default.
+    n.add_argument("--image", default=None,
+                   help=f"image (default: {DEFAULT_IMAGE}, or the template's)")
+    n.add_argument("--port", type=int, default=None,
+                   help=f"guest web port to publish "
+                        f"(default: {DEFAULT_GUEST_PORT}, or the template's)")
     n.add_argument("--cpus", type=int, help="vCPUs")
     n.add_argument("--memory", help="memory, e.g. 1G")
     n.set_defaults(func=cmd_new)
 
     l = sub.add_parser("ls", help="list boxes")
     l.set_defaults(func=cmd_ls)
+
+    tm = sub.add_parser("templates", help="list available box templates")
+    tm.set_defaults(func=cmd_templates)
 
     e = sub.add_parser("exec", help="run a command in a box  (vm exec NAME -- cmd)")
     e.add_argument("name")

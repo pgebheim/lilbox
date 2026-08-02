@@ -1,0 +1,6 @@
+{
+  "image": "python",
+  "memory": "2G",
+  "port": 8000,
+  "description": "Python + git + uv"
+}
