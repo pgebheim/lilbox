@@ -359,15 +359,36 @@ def _install_agent(name):
         warn(f"agent install reported: {err.strip() or out.strip()}")
 
 
+def _resolve_workspace(args):
+    """The host dir to bind-mount at /workspace: a fresh --clone, an explicit
+    --workspace, or the current directory. Edits there ARE the result — the
+    mount is live, so the agent's changes appear on the host as it works."""
+    if getattr(args, "clone", None):
+        repo = args.clone.rstrip("/").rsplit("/", 1)[-1]
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        dest = os.path.join(STATE_DIR, "workspaces", repo or "repo")
+        if os.path.exists(dest):
+            die(f"clone target already exists: {dest} (remove it, or use --workspace)")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        info(f"cloning {args.clone} → {dim(dest)} …")
+        rc, out, err = run(["git", "clone", "--depth", "1", args.clone, dest])
+        if rc != 0:
+            die(f"git clone failed: {err.strip() or out.strip()}")
+        return dest
+    ws = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
+    if not os.path.isdir(ws):
+        die(f"workspace not found: {ws}")
+    return ws
+
+
 def cmd_agent(args):
     con = db()
     name = args.name
     if name and get_box(con, name):
         die(f"box '{name}' already exists")
 
-    workspace = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
-    if not os.path.isdir(workspace):
-        die(f"workspace not found: {workspace}")
+    workspace = _resolve_workspace(args)
 
     host_port = alloc_host_port()
     create = build_create_args(name, host_port, DEFAULT_GUEST_PORT, args.image,
@@ -684,8 +705,11 @@ def build_parser():
                         help="run a coding agent in a box against a workspace  (vm agent [NAME] -- task)")
     ag.add_argument("name", nargs="?", help="box name (auto-generated if omitted)")
     ag.add_argument("--image", default=DEFAULT_IMAGE, help="base image")
-    ag.add_argument("--workspace",
-                    help="host dir to mount at /workspace (default: current dir)")
+    ag_ws = ag.add_mutually_exclusive_group()
+    ag_ws.add_argument("--workspace",
+                       help="host dir to mount at /workspace (default: current dir)")
+    ag_ws.add_argument("--clone", metavar="URL",
+                       help="git clone URL into ~/.lilexe/workspaces/ and mount that")
     ag.set_defaults(func=cmd_agent)
 
     d = sub.add_parser("doctor", help="check the local runtime")
