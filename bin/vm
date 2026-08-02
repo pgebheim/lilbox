@@ -29,6 +29,8 @@ DB_PATH = os.path.join(STATE_DIR, "state.db")
 
 DEFAULT_IMAGE = "python"
 DEFAULT_GUEST_PORT = 8000
+DEFAULT_HOME = "/root"           # where a box's persistent volume mounts
+# TODO(template): make the home path template-derived once #8 lands non-root users
 SERVE_PORT_BASE = 8443           # tailnet HTTPS ports we hand out (avoid 443 = caddy)
 SERVE_PORT_MAX = 8480
 FUNNEL_PORTS = {443, 8443, 10000}  # ports Tailscale Funnel is allowed to use
@@ -159,10 +161,15 @@ def db():
             public     INTEGER DEFAULT 0,
             url        TEXT,
             created    TEXT,
-            comment    TEXT
+            comment    TEXT,
+            volume     TEXT
         )
         """
     )
+    # Migrate pre-existing DBs that predate the `volume` column.
+    cols = {r[1] for r in con.execute("PRAGMA table_info(boxes)")}
+    if "volume" not in cols:
+        con.execute("ALTER TABLE boxes ADD COLUMN volume TEXT")
     return con
 
 
@@ -175,6 +182,22 @@ def require_box(con, name):
     if not row:
         die(f"no box named '{name}' (see: vm ls)")
     return row
+
+
+def volume_name_for(box):
+    """The named msb volume that backs a box's home, e.g. lilexe-web-home."""
+    return f"lilexe-{box}-home"
+
+
+def gen_box_name(con):
+    """A unique box name. We name boxes up front (rather than letting msb
+    auto-generate) so a persistent volume can be attached at create time."""
+    known = {r["name"] for r in con.execute("SELECT name FROM boxes")} | set(live_status())
+    for _ in range(100):
+        cand = f"box-{os.urandom(3).hex()}"
+        if cand not in known:
+            return cand
+    die("could not generate a unique box name")
 
 
 # --------------------------------------------------------------------------
@@ -277,45 +300,43 @@ def split_ddash(argv):
 
 def cmd_new(args):
     con = db()
-    name = args.name
-    if name and get_box(con, name):
+    # Name the box up front (generating one when omitted) so a persistent
+    # volume can be attached at create time.
+    name = args.name or gen_box_name(con)
+    if get_box(con, name):
         die(f"box '{name}' already exists")
+
+    volume = None if args.no_persist else volume_name_for(name)
 
     host_port = alloc_host_port()
     guest_port = args.port
-    create = ["create", "--net", "public", "--port", f"{host_port}:{guest_port}"]
-    if name:
-        create += ["--name", name]
+    create = ["create", "--net", "public",
+              "--port", f"{host_port}:{guest_port}", "--name", name]
+    if volume:
+        # --mount-named auto-creates the volume on first boot.
+        create += ["--mount-named", f"{volume}:{DEFAULT_HOME}"]
     if args.cpus:
         create += ["--cpus", str(args.cpus)]
     if args.memory:
         create += ["--memory", args.memory]
     create.append(args.image)
 
-    info(f"booting {bold(args.image)} microVM"
-         + (f" as {bold(name)}" if name else "") + " …")
+    info(f"booting {bold(args.image)} microVM as {bold(name)}"
+         + (dim(" (persistent)") if volume else "") + " …")
     rc, out, err = msb(*create)
     if rc != 0:
         die(f"microsandbox create failed: {err.strip() or out.strip()}")
 
-    # msb auto-generates a name when --name is omitted; discover it.
-    if not name:
-        known = {r["name"] for r in con.execute("SELECT name FROM boxes")}
-        for n in live_status():
-            if n not in known:
-                name = n
-                break
-        if not name:
-            die("created a box but could not determine its name (see: msb ls)")
-
     con.execute(
-        "INSERT OR REPLACE INTO boxes(name,image,guest_port,host_port,created) "
-        "VALUES(?,?,?,?,?)",
+        "INSERT OR REPLACE INTO boxes"
+        "(name,image,guest_port,host_port,created,volume) "
+        "VALUES(?,?,?,?,?,?)",
         (name, args.image, guest_port, host_port,
-         time.strftime("%Y-%m-%d %H:%M:%S")),
+         time.strftime("%Y-%m-%d %H:%M:%S"), volume),
     )
     con.commit()
-    ok(f"box {bold(name)} is up ({args.image}, guest :{guest_port})")
+    persist = f", home persists in {volume}" if volume else ""
+    ok(f"box {bold(name)} is up ({args.image}, guest :{guest_port}{persist})")
     print(dim(f"  vm exec {name} -- <cmd>     run a command"))
     print(dim(f"  vm ssh {name}               open a shell"))
     print(dim(f"  vm expose {name}            publish :{guest_port} to your tailnet"))
@@ -536,6 +557,8 @@ def build_parser():
                    help=f"guest web port to publish (default: {DEFAULT_GUEST_PORT})")
     n.add_argument("--cpus", type=int, help="vCPUs")
     n.add_argument("--memory", help="memory, e.g. 1G")
+    n.add_argument("--no-persist", action="store_true",
+                   help="don't attach a persistent home volume (ephemeral home)")
     n.set_defaults(func=cmd_new)
 
     l = sub.add_parser("ls", help="list boxes")
