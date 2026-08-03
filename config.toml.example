@@ -1,0 +1,6 @@
+# lilexe config — copy to ~/.lilexe/config.toml
+# Flat key = value only (stdlib-parsed; no nested tables).
+image = "python"
+port = 8000
+cpus = 2
+memory = "2G"
