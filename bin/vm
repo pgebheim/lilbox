@@ -159,10 +159,17 @@ def db():
             public     INTEGER DEFAULT 0,
             url        TEXT,
             created    TEXT,
-            comment    TEXT
+            comment    TEXT,
+            expires    INTEGER,
+            stopped_reason TEXT
         )
         """
     )
+    # Migrate pre-existing DBs that predate these columns.
+    cols = {r[1] for r in con.execute("PRAGMA table_info(boxes)")}
+    for col, decl in (("expires", "INTEGER"), ("stopped_reason", "TEXT")):
+        if col not in cols:
+            con.execute(f"ALTER TABLE boxes ADD COLUMN {col} {decl}")
     return con
 
 
@@ -175,6 +182,16 @@ def require_box(con, name):
     if not row:
         die(f"no box named '{name}' (see: vm ls)")
     return row
+
+
+def parse_duration(s):
+    """'2h' / '30m' / '45s' / '1d' (or bare seconds) → int seconds."""
+    s = str(s).strip()
+    unit = s[-1] if s and s[-1] in "dhms" else ""
+    num = s[:-1] if unit else s
+    if not num.isdigit() or (unit == "" and not num):
+        die(f"invalid duration '{s}' (use e.g. 30s, 5m, 2h, 1d)")
+    return int(num) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
 
 
 # --------------------------------------------------------------------------
@@ -308,14 +325,18 @@ def cmd_new(args):
         if not name:
             die("created a box but could not determine its name (see: msb ls)")
 
+    # TTL: lilexe tracks an absolute expiry (epoch); `vm gc` reaps it. (A
+    # persistent box isn't killed by msb — gc removes it and its state together.)
+    expires = int(time.time()) + parse_duration(args.ttl) if args.ttl else None
     con.execute(
-        "INSERT OR REPLACE INTO boxes(name,image,guest_port,host_port,created) "
-        "VALUES(?,?,?,?,?)",
+        "INSERT OR REPLACE INTO boxes"
+        "(name,image,guest_port,host_port,created,expires) VALUES(?,?,?,?,?,?)",
         (name, args.image, guest_port, host_port,
-         time.strftime("%Y-%m-%d %H:%M:%S")),
+         time.strftime("%Y-%m-%d %H:%M:%S"), expires),
     )
     con.commit()
-    ok(f"box {bold(name)} is up ({args.image}, guest :{guest_port})")
+    ttl_note = f", expires in {args.ttl}" if args.ttl else ""
+    ok(f"box {bold(name)} is up ({args.image}, guest :{guest_port}{ttl_note})")
     print(dim(f"  vm exec {name} -- <cmd>     run a command"))
     print(dim(f"  vm ssh {name}               open a shell"))
     print(dim(f"  vm expose {name}            publish :{guest_port} to your tailnet"))
@@ -359,8 +380,11 @@ def cmd_ssh(args):
 
 
 def cmd_run(args):
-    # Ephemeral: boot, run, discard. No state row.
+    # Ephemeral: boot, run, discard. No state row — so a TTL maps straight to
+    # msb's own --max-duration (msb kills it after the window).
     cmd = [MSB, "run", args.image]
+    if args.ttl:
+        cmd += ["--max-duration", str(parse_duration(args.ttl)) + "s"]
     if args.cmd:
         cmd += ["--", *args.cmd]
     exec_replace(cmd)
@@ -437,19 +461,40 @@ def cmd_restart(args):
     _lifecycle(args.name, "restart")
 
 
-def cmd_rm(args):
-    con = db()
-    row = require_box(con, args.name)
+def _teardown_box(con, row):
+    """Unpublish, stop, remove a box, and delete its state row. Shared by
+    `vm rm` and `vm gc`."""
+    name = row["name"]
     if row["serve_port"] and TS:
         verb = "funnel" if row["public"] else "serve"
         run([TS, verb, f"--https={row['serve_port']}", "off"])
-    msb("stop", args.name)  # best effort
-    rc, out, err = msb("rm", args.name)
+    msb("stop", name)  # best effort
+    rc, out, err = msb("rm", name)
     if rc != 0 and "not found" not in (err + out).lower():
         warn(f"msb rm reported: {err.strip() or out.strip()}")
-    con.execute("DELETE FROM boxes WHERE name=?", (args.name,))
+    con.execute("DELETE FROM boxes WHERE name=?", (name,))
     con.commit()
+
+
+def cmd_rm(args):
+    con = db()
+    row = require_box(con, args.name)
+    _teardown_box(con, row)
     ok(f"removed {bold(args.name)}")
+
+
+def cmd_gc(args):
+    con = db()
+    now = int(time.time())
+    expired = con.execute(
+        "SELECT * FROM boxes WHERE expires IS NOT NULL AND expires < ?",
+        (now,)).fetchall()
+    if not expired:
+        print(dim("nothing to gc — no expired boxes"))
+        return
+    for row in expired:
+        _teardown_box(con, row)
+        ok(f"reaped {bold(row['name'])} (TTL elapsed)")
 
 
 def cmd_fork(args):
@@ -536,10 +581,14 @@ def build_parser():
                    help=f"guest web port to publish (default: {DEFAULT_GUEST_PORT})")
     n.add_argument("--cpus", type=int, help="vCPUs")
     n.add_argument("--memory", help="memory, e.g. 1G")
+    n.add_argument("--ttl", help="auto-expire after this long (e.g. 2h); reaped by `vm gc`")
     n.set_defaults(func=cmd_new)
 
     l = sub.add_parser("ls", help="list boxes")
     l.set_defaults(func=cmd_ls)
+
+    g = sub.add_parser("gc", help="reap boxes whose TTL has elapsed (cron-friendly)")
+    g.set_defaults(func=cmd_gc)
 
     e = sub.add_parser("exec", help="run a command in a box  (vm exec NAME -- cmd)")
     e.add_argument("name")
@@ -551,6 +600,7 @@ def build_parser():
 
     r = sub.add_parser("run", help="ephemeral box: boot, run, discard")
     r.add_argument("--image", default=DEFAULT_IMAGE)
+    r.add_argument("--ttl", help="kill the ephemeral box after this long (e.g. 30m)")
     r.set_defaults(func=cmd_run)
 
     x = sub.add_parser("expose", help="publish a box to your tailnet (HTTPS)")
