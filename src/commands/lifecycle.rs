@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
 use microsandbox::{MicrosandboxError, Sandbox, Volume, sandbox::SandboxStatus};
 use rusqlite::params;
@@ -114,9 +114,24 @@ pub(crate) async fn fork(app: &App, name: String, newname: Option<String>) -> Re
     );
     handle.stop().await?;
     let snapshot = format!("lilexe-{name}-{}", now());
-    handle.snapshot(&snapshot).await?;
+    let snapshot_result = handle.snapshot(&snapshot).await;
     if was_running {
-        Sandbox::start_detached(&name).await?;
+        let restart_result = Sandbox::start_detached(&name).await;
+        match (snapshot_result, restart_result) {
+            (Ok(_), Ok(_)) => {}
+            (Err(snapshot_error), Ok(_)) => return Err(snapshot_error.into()),
+            (Ok(_), Err(restart_error)) => {
+                return Err(restart_error)
+                    .with_context(|| format!("snapshot created but could not restart '{name}'"));
+            }
+            (Err(snapshot_error), Err(restart_error)) => {
+                bail!(
+                    "snapshot failed: {snapshot_error}; additionally could not restart '{name}': {restart_error}"
+                );
+            }
+        }
+    } else {
+        snapshot_result?;
     }
     let host_port = alloc_host_port()?;
     let guest_port = row.guest_port.unwrap_or(DEFAULT_GUEST_PORT);

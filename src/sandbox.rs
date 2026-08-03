@@ -1,10 +1,11 @@
 use std::{
     collections::HashMap,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
+    thread,
 };
 
 use anyhow::{Context, Result, bail};
-use microsandbox::{MicrosandboxError, Sandbox, sandbox::SandboxStatus};
+use microsandbox::{ExecEvent, MicrosandboxError, Sandbox, sandbox::SandboxStatus};
 
 use crate::app::App;
 use crate::cli::{ExecArgs, RunArgs};
@@ -69,7 +70,8 @@ pub(crate) async fn run_guest(
     }
     let cmd = &command[0];
     let args = &command[1..];
-    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+    let stdin_is_terminal = io::stdin().is_terminal();
+    if stdin_is_terminal && io::stdout().is_terminal() {
         return Ok(sandbox
             .attach_with(cmd, |a| {
                 let a = a.args(args.iter().cloned());
@@ -77,15 +79,97 @@ pub(crate) async fn run_guest(
             })
             .await?);
     }
-    let output = sandbox
-        .exec_with(cmd, |e| {
+    let mut handle = sandbox
+        .exec_stream_with(cmd, |e| {
             let e = e.args(args.iter().cloned());
+            let e = if stdin_is_terminal {
+                e.stdin_null()
+            } else {
+                e.stdin_pipe()
+            };
             if let Some(cwd) = cwd { e.cwd(cwd) } else { e }
         })
         .await?;
-    io::stdout().write_all(output.stdout_bytes())?;
-    io::stderr().write_all(output.stderr_bytes())?;
-    Ok(output.status().code)
+    let stdin_sink = handle.take_stdin();
+    if !stdin_is_terminal && stdin_sink.is_none() {
+        bail!("microsandbox did not provide a stdin pipe");
+    }
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(1);
+    let mut stdin_open = !stdin_is_terminal;
+    if stdin_open {
+        thread::spawn(move || {
+            let mut stdin = io::stdin().lock();
+            let mut buffer = [0_u8; 16 * 1024];
+            loop {
+                match stdin.read(&mut buffer) {
+                    Ok(0) => {
+                        let _ = input_tx.blocking_send(Ok(Vec::new()));
+                        break;
+                    }
+                    Ok(count) => {
+                        if input_tx
+                            .blocking_send(Ok(buffer[..count].to_vec()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = input_tx.blocking_send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    loop {
+        tokio::select! {
+            event = handle.recv() => match event {
+                Some(ExecEvent::Started { .. }) => {}
+                Some(ExecEvent::Stdout(data)) => {
+                    let mut stdout = io::stdout().lock();
+                    stdout.write_all(&data)?;
+                    stdout.flush()?;
+                }
+                Some(ExecEvent::Stderr(data)) => {
+                    let mut stderr = io::stderr().lock();
+                    stderr.write_all(&data)?;
+                    stderr.flush()?;
+                }
+                Some(ExecEvent::Exited { code }) => return Ok(code),
+                Some(ExecEvent::Failed(error)) => {
+                    return Err(MicrosandboxError::ExecFailed(error).into());
+                }
+                Some(ExecEvent::StdinError(error)) => {
+                    eprintln!("warning: guest stdin closed: {error:?}");
+                    stdin_open = false;
+                }
+                None => bail!("exec session ended without an exit event"),
+            },
+            input = input_rx.recv(), if stdin_open => {
+                match input {
+                    Some(Ok(data)) if data.is_empty() => {
+                        if let Err(error) = stdin_sink.as_ref().unwrap().close().await {
+                            eprintln!("warning: could not close guest stdin: {error}");
+                        }
+                        stdin_open = false;
+                    }
+                    Some(Ok(data)) => {
+                        if let Err(error) = stdin_sink.as_ref().unwrap().write(data).await {
+                            eprintln!("warning: could not write guest stdin: {error}");
+                            stdin_open = false;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        eprintln!("warning: could not read host stdin: {error}");
+                        stdin_open = false;
+                    }
+                    None => stdin_open = false,
+                }
+            }
+        }
+    }
 }
 
 pub(crate) async fn exec(app: &App, args: ExecArgs) -> Result<i32> {

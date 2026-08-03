@@ -17,8 +17,9 @@ use cli::Cli;
 
 #[tokio::main]
 async fn main() {
-    let code = match App::new().map(|app| (app, Cli::parse().command)) {
-        Ok((app, command)) => match commands::dispatch(&app, command).await {
+    let command = Cli::parse().command;
+    let code = match App::new() {
+        Ok(app) => match commands::dispatch(&app, command).await {
             Ok(code) => code,
             Err(error) => {
                 eprintln!("error: {error:#}");
