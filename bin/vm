@@ -246,11 +246,14 @@ def alloc_host_port():
 # Live status from msb
 # --------------------------------------------------------------------------
 
-def live_status():
-    """Map of sandbox name -> status string, from `msb ls`."""
+def live_status(strict=False):
+    """Map of sandbox name -> status string, from `msb ls`. With strict=True,
+    a failed `msb ls` is fatal (for `--json`, which must not emit bogus data)."""
     rc, out, _ = msb("ls")
     status = {}
     if rc != 0:
+        if strict:
+            die("could not query box status (msb ls failed)")
         return status
     for line in out.strip().splitlines()[1:]:  # skip header
         parts = line.split()
@@ -324,6 +327,20 @@ def cmd_new(args):
 def cmd_ls(args):
     con = db()
     rows = con.execute("SELECT * FROM boxes ORDER BY created").fetchall()
+    if getattr(args, "json", False):
+        status = live_status(strict=True)
+        print(json.dumps([{
+            "name": r["name"],
+            "image": r["image"],
+            "status": status.get(r["name"], "gone"),
+            "guest_port": r["guest_port"],
+            "host_port": r["host_port"],
+            "serve_port": r["serve_port"],
+            "public": bool(r["public"]),
+            "url": r["url"],
+            "created": r["created"],
+        } for r in rows]))
+        return
     status = live_status()
     if not rows:
         print(dim("no boxes yet — create one with:  vm new"))
@@ -539,6 +556,7 @@ def build_parser():
     n.set_defaults(func=cmd_new)
 
     l = sub.add_parser("ls", help="list boxes")
+    l.add_argument("--json", action="store_true", help="machine-readable JSON output")
     l.set_defaults(func=cmd_ls)
 
     e = sub.add_parser("exec", help="run a command in a box  (vm exec NAME -- cmd)")
