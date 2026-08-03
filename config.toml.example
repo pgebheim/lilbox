@@ -2,6 +2,8 @@
 # Flat key = value only (parsed stdlib-only; no nested tables).
 
 # Defaults applied to `vm new` when the matching flag is omitted.
+image = "python"
+port = 8000
 cpus = 2
 memory = "2G"
 ttl = "8h"

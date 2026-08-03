@@ -429,7 +429,7 @@ def parse_config(text):
 
 
 def load_config():
-    """Read ~/.lilexe/config.toml → dict (empty if absent)."""
+    """Read ~/.lilexe/config.toml → dict of defaults (empty if absent)."""
     if not os.path.isfile(CONFIG_PATH):
         return {}
     try:
@@ -508,11 +508,14 @@ def alloc_host_port():
 # Live status from msb
 # --------------------------------------------------------------------------
 
-def live_status():
-    """Map of sandbox name -> status string, from `msb ls`."""
+def live_status(strict=False):
+    """Map of sandbox name -> status string, from `msb ls`. With strict=True,
+    a failed `msb ls` is fatal (for `--json`, which must not emit bogus data)."""
     rc, out, _ = msb("ls")
     status = {}
     if rc != 0:
+        if strict:
+            die("could not query box status (msb ls failed)")
         return status
     for line in out.strip().splitlines()[1:]:  # skip header
         parts = line.split()
@@ -573,7 +576,7 @@ def cmd_new(args):
     cfg = load_config()
 
     # Image precedence: CLI --image > template image > template Dockerfile build
-    # > built-in default.
+    # > config default > built-in.
     if args.image:
         image = args.image
     elif tmpl and tmpl["image"]:
@@ -581,9 +584,9 @@ def cmd_new(args):
     elif tmpl and tmpl["dockerfile"]:
         image = build_template_image(tmpl, rebuild=args.rebuild)
     else:
-        image = DEFAULT_IMAGE
+        image = cfg.get("image") or DEFAULT_IMAGE
     # Other resources: CLI flag > template > config default > built-in.
-    guest_port = args.port or (tmpl and tmpl["port"]) or DEFAULT_GUEST_PORT
+    guest_port = args.port or (tmpl and tmpl["port"]) or cfg.get("port") or DEFAULT_GUEST_PORT
     cpus = args.cpus or (tmpl and tmpl["cpus"]) or cfg.get("cpus")
     memory = args.memory or (tmpl and tmpl["memory"]) or cfg.get("memory")
     ttl = args.ttl or cfg.get("ttl")
@@ -787,6 +790,20 @@ def cmd_agent(args):
 def cmd_ls(args):
     con = db()
     rows = con.execute("SELECT * FROM boxes ORDER BY created").fetchall()
+    if getattr(args, "json", False):
+        status = live_status(strict=True)
+        print(json.dumps([{
+            "name": r["name"],
+            "image": r["image"],
+            "status": status.get(r["name"], "gone"),
+            "guest_port": r["guest_port"],
+            "host_port": r["host_port"],
+            "serve_port": r["serve_port"],
+            "public": bool(r["public"]),
+            "url": r["url"],
+            "created": r["created"],
+        } for r in rows]))
+        return
     status = live_status()
     if not rows:
         print(dim("no boxes yet — create one with:  vm new"))
@@ -848,6 +865,26 @@ def cmd_run(args):
         cmd += ["--max-duration", str(parse_duration(args.ttl)) + "s"]
     if args.cmd:
         cmd += ["--", *args.cmd]
+    exec_replace(cmd)
+
+
+def cmd_cp(args):
+    # Thin passthrough to `msb copy`. Use NAME:/abs/path for the box side, e.g.
+    #   vm cp ./file web:/root/file      (host -> box)
+    #   vm cp web:/root/out ./out        (box  -> host)
+    exec_replace([MSB, "copy", args.src, args.dst])
+
+
+def cmd_logs(args):
+    con = db()
+    require_box(con, args.name)
+    cmd = [MSB, "logs", args.name]
+    if args.follow:
+        cmd.append("--follow")
+    if args.tail is not None:
+        cmd += ["--tail", str(args.tail)]
+    if args.source:
+        cmd += ["--source", args.source]
     exec_replace(cmd)
 
 
@@ -1150,12 +1187,12 @@ def build_parser():
     n.add_argument("name", nargs="?", help="box name (auto-generated if omitted)")
     n.add_argument("--template", help="boot from a template (see: vm templates)")
     # Defaults are None so precedence resolves in cmd_new:
-    # CLI flag > template value > built-in default.
+    # CLI flag > template > config > built-in default.
     n.add_argument("--image", default=None,
-                   help=f"image (default: {DEFAULT_IMAGE}, or the template's)")
+                   help=f"image (default: {DEFAULT_IMAGE}, or template/config)")
     n.add_argument("--port", type=int, default=None,
                    help=f"guest web port to publish "
-                        f"(default: {DEFAULT_GUEST_PORT}, or the template's)")
+                        f"(default: {DEFAULT_GUEST_PORT}, or template/config)")
     n.add_argument("--cpus", type=int, help="vCPUs")
     n.add_argument("--memory", help="memory, e.g. 1G")
     n.add_argument("--rebuild", action="store_true",
@@ -1170,6 +1207,7 @@ def build_parser():
     n.set_defaults(func=cmd_new)
 
     l = sub.add_parser("ls", help="list boxes")
+    l.add_argument("--json", action="store_true", help="machine-readable JSON output")
     l.set_defaults(func=cmd_ls)
 
     g = sub.add_parser("gc", help="reap boxes whose TTL has elapsed (cron-friendly)")
@@ -1194,6 +1232,18 @@ def build_parser():
     r.add_argument("--image", default=DEFAULT_IMAGE)
     r.add_argument("--ttl", help="kill the ephemeral box after this long (e.g. 30m)")
     r.set_defaults(func=cmd_run)
+
+    cp = sub.add_parser("cp", help="copy files to/from a box  (vm cp SRC DST; box side = NAME:/path)")
+    cp.add_argument("src")
+    cp.add_argument("dst")
+    cp.set_defaults(func=cmd_cp)
+
+    lg = sub.add_parser("logs", help="show a box's captured output")
+    lg.add_argument("name")
+    lg.add_argument("-f", "--follow", action="store_true", help="stream new output")
+    lg.add_argument("--tail", type=int, help="only the last N lines")
+    lg.add_argument("--source", help="stdout,stderr (default), system, or all")
+    lg.set_defaults(func=cmd_logs)
 
     x = sub.add_parser("expose", help="publish a box to your tailnet (HTTPS)")
     x.add_argument("name")

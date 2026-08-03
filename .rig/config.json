@@ -8,7 +8,7 @@
     "packageManager": "none"
   },
   "test": {
-    "command": "python3 -m py_compile bin/vm",
+    "command": "python3 -m py_compile bin/vm && python3 -m unittest discover -s tests",
     "requiresDatabase": false
   },
   "sourceScope": ["bin"],
