@@ -8,10 +8,10 @@
     "packageManager": "none"
   },
   "test": {
-    "command": "python3 -m py_compile bin/vm && python3 -m unittest discover -s tests",
+    "command": "cargo test",
     "requiresDatabase": false
   },
-  "sourceScope": ["bin"],
+  "sourceScope": ["src"],
   "vcs": {
     "defaultBranch": "main",
     "baseRef": "origin/main",
