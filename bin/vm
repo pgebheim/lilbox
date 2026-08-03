@@ -26,6 +26,7 @@ import time
 HOME = os.path.expanduser("~")
 STATE_DIR = os.path.join(HOME, ".lilexe")
 DB_PATH = os.path.join(STATE_DIR, "state.db")
+CONFIG_PATH = os.path.join(STATE_DIR, "config.toml")
 
 DEFAULT_IMAGE = "python"
 DEFAULT_GUEST_PORT = 8000
@@ -194,6 +195,43 @@ def parse_duration(s):
     return int(num) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
 
 
+def parse_size(s):
+    """'512M' / '1G' / '2048' → int MiB (for comparing against memory caps)."""
+    s = str(s).strip()
+    unit = s[-1].upper() if s and s[-1].upper() in "MGT" else ""
+    num = s[:-1] if unit else s
+    try:
+        n = float(num)
+    except ValueError:
+        die(f"invalid memory size '{s}' (use e.g. 512M, 1G)")
+    return int(n * {"": 1, "M": 1, "G": 1024, "T": 1024 * 1024}[unit])
+
+
+def parse_config(text):
+    """A tiny flat-TOML subset (stdlib-only; tomllib is 3.11+): `key = value`
+    lines, `#` comments, quotes stripped, bare ints coerced. Sections ignored."""
+    cfg = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("[") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip().split("#", 1)[0].strip().strip('"').strip("'")
+        cfg[k] = int(v) if v.isdigit() else v
+    return cfg
+
+
+def load_config():
+    """Read ~/.lilexe/config.toml → dict (empty if absent)."""
+    if not os.path.isfile(CONFIG_PATH):
+        return {}
+    try:
+        with open(CONFIG_PATH) as f:
+            return parse_config(f.read())
+    except OSError as e:
+        die(f"could not read {CONFIG_PATH}: {e}")
+
+
 # --------------------------------------------------------------------------
 # Tailscale helpers
 # --------------------------------------------------------------------------
@@ -298,18 +336,33 @@ def cmd_new(args):
     if name and get_box(con, name):
         die(f"box '{name}' already exists")
 
+    # Resolve resources: CLI flag > config default > built-in. Then clamp to any
+    # configured caps (max_cpus / max_memory) — a request over the cap is reduced.
+    cfg = load_config()
+    cpus = args.cpus or cfg.get("cpus")
+    memory = args.memory or cfg.get("memory")
+    ttl = args.ttl or cfg.get("ttl")
+    idle_timeout = args.idle_timeout or cfg.get("idle_timeout")
+    if cpus and cfg.get("max_cpus") and int(cpus) > int(cfg["max_cpus"]):
+        warn(f"cpus {cpus} exceeds max_cpus {cfg['max_cpus']} — clamping")
+        cpus = int(cfg["max_cpus"])
+    if memory and cfg.get("max_memory") and \
+            parse_size(memory) > parse_size(cfg["max_memory"]):
+        warn(f"memory {memory} exceeds max_memory {cfg['max_memory']} — clamping")
+        memory = str(cfg["max_memory"])
+
     host_port = alloc_host_port()
     guest_port = args.port
     create = ["create", "--net", "public", "--port", f"{host_port}:{guest_port}"]
     if name:
         create += ["--name", name]
-    if args.cpus:
-        create += ["--cpus", str(args.cpus)]
-    if args.memory:
-        create += ["--memory", args.memory]
-    if args.idle_timeout:
+    if cpus:
+        create += ["--cpus", str(cpus)]
+    if memory:
+        create += ["--memory", str(memory)]
+    if idle_timeout:
         # msb suspends the box after this idle window; `vm exec`/`vm ssh` resume it.
-        create += ["--idle-timeout", str(parse_duration(args.idle_timeout)) + "s"]
+        create += ["--idle-timeout", str(parse_duration(idle_timeout)) + "s"]
     create.append(args.image)
 
     info(f"booting {bold(args.image)} microVM"
@@ -330,7 +383,7 @@ def cmd_new(args):
 
     # TTL: lilexe tracks an absolute expiry (epoch); `vm gc` reaps it. (A
     # persistent box isn't killed by msb — gc removes it and its state together.)
-    expires = int(time.time()) + parse_duration(args.ttl) if args.ttl else None
+    expires = int(time.time()) + parse_duration(ttl) if ttl else None
     con.execute(
         "INSERT OR REPLACE INTO boxes"
         "(name,image,guest_port,host_port,created,expires) VALUES(?,?,?,?,?,?)",
@@ -338,7 +391,7 @@ def cmd_new(args):
          time.strftime("%Y-%m-%d %H:%M:%S"), expires),
     )
     con.commit()
-    ttl_note = f", expires in {args.ttl}" if args.ttl else ""
+    ttl_note = f", expires in {ttl}" if ttl else ""
     ok(f"box {bold(name)} is up ({args.image}, guest :{guest_port}{ttl_note})")
     print(dim(f"  vm exec {name} -- <cmd>     run a command"))
     print(dim(f"  vm ssh {name}               open a shell"))
