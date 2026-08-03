@@ -307,6 +307,9 @@ def cmd_new(args):
         create += ["--cpus", str(args.cpus)]
     if args.memory:
         create += ["--memory", args.memory]
+    if args.idle_timeout:
+        # msb suspends the box after this idle window; `vm exec`/`vm ssh` resume it.
+        create += ["--idle-timeout", str(parse_duration(args.idle_timeout)) + "s"]
     create.append(args.image)
 
     info(f"booting {bold(args.image)} microVM"
@@ -361,11 +364,35 @@ def cmd_ls(args):
               f"{st_c}{' ' * max(0, 9 - len(st))}  {url}")
 
 
+def _set_stopped_reason(name, reason):
+    con = db()
+    con.execute("UPDATE boxes SET stopped_reason=? WHERE name=?", (reason, name))
+    con.commit()
+
+
+def _ensure_running(con, name):
+    """Transparently resume an idle-suspended box before use. A box the user
+    stopped on purpose (`vm stop`) is NOT auto-resumed — that would fight a
+    deliberate stop; msb gives no idle-vs-user signal, so we track it ourselves."""
+    if live_status().get(name) != "stopped":
+        return
+    row = get_box(con, name)
+    if row and row["stopped_reason"] == "user":
+        die(f"box '{name}' is stopped — start it with: vm start {name}")
+    info(f"resuming {bold(name)} …")
+    rc, out, err = msb("start", name)
+    if rc != 0:
+        die(f"could not resume '{name}': {err.strip() or out.strip()}")
+    con.execute("UPDATE boxes SET stopped_reason=NULL WHERE name=?", (name,))
+    con.commit()
+
+
 def cmd_exec(args):
     con = db()
     require_box(con, args.name)
     if not args.cmd:
         die("nothing to run — usage: vm exec NAME -- <cmd>")
+    _ensure_running(con, args.name)
     tty = ["--tty"] if (sys.stdin.isatty() and sys.stdout.isatty()) else []
     exec_replace([MSB, "exec", *tty, args.name, "--", *args.cmd])
 
@@ -373,6 +400,7 @@ def cmd_exec(args):
 def cmd_ssh(args):
     con = db()
     require_box(con, args.name)
+    _ensure_running(con, args.name)
     cmd = [MSB, "ssh", args.name]
     if args.cmd:
         cmd += ["--", *args.cmd]
@@ -451,14 +479,17 @@ def _lifecycle(name, action):
 
 def cmd_stop(args):
     _lifecycle(args.name, "stop")
+    _set_stopped_reason(args.name, "user")  # a deliberate stop; don't auto-resume
 
 
 def cmd_start(args):
     _lifecycle(args.name, "start")
+    _set_stopped_reason(args.name, None)
 
 
 def cmd_restart(args):
     _lifecycle(args.name, "restart")
+    _set_stopped_reason(args.name, None)
 
 
 def _teardown_box(con, row):
@@ -582,6 +613,8 @@ def build_parser():
     n.add_argument("--cpus", type=int, help="vCPUs")
     n.add_argument("--memory", help="memory, e.g. 1G")
     n.add_argument("--ttl", help="auto-expire after this long (e.g. 2h); reaped by `vm gc`")
+    n.add_argument("--idle-timeout",
+                   help="suspend the box after this idle window (e.g. 20m); resumes on next use")
     n.set_defaults(func=cmd_new)
 
     l = sub.add_parser("ls", help="list boxes")
