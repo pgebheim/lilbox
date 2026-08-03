@@ -1,0 +1,51 @@
+#!/bin/sh
+# lilexe-box first-boot bring-up hook.
+#
+# Starts tailscaled inside the box using a real kernel tun device. The libkrun
+# guest exposes /dev/net/tun and CAP_NET_ADMIN, so the box gets its own tailnet
+# IP, MagicDNS name, and Tailscale SSH (kernel networking) rather than the
+# limited userspace-networking mode.
+#
+# This hook only starts the DAEMON. Joining the tailnet as a tagged ephemeral
+# node -- `tailscale up --auth-key=... --advertise-tags=tag:lilexe-box --ssh` --
+# is done by `vm new` (issue #4), which injects the auth key via `msb --secret`.
+# Kept idempotent so it is safe to invoke more than once.
+set -eu
+
+STATE=/var/lib/tailscale/tailscaled.state
+SOCK=/var/run/tailscale/tailscaled.sock
+TUN="${TS_TUN:-tailscale0}"
+
+# Already up? Nothing to do.
+if pidof tailscaled >/dev/null 2>&1; then
+  exit 0
+fi
+
+mkdir -p /var/lib/tailscale /var/run/tailscale
+
+# Prefer kernel networking (a real tun); fall back to userspace only if the
+# guest somehow lacks /dev/net/tun.
+if [ -c /dev/net/tun ]; then
+  TUN_ARG="--tun=$TUN"
+else
+  echo "lilexe-boot: /dev/net/tun absent -- falling back to userspace networking" >&2
+  TUN_ARG="--tun=userspace-networking"
+fi
+
+# shellcheck disable=SC2086  # TUN_ARG is a single intentional argument
+tailscaled \
+  --state="$STATE" \
+  --socket="$SOCK" \
+  $TUN_ARG \
+  >/var/log/tailscaled.log 2>&1 &
+
+# Wait for the control socket so a caller can `tailscale up` immediately after.
+i=0
+while [ "$i" -lt 40 ]; do
+  [ -S "$SOCK" ] && exit 0
+  i=$((i + 1))
+  sleep 0.25
+done
+
+echo "lilexe-boot: tailscaled socket did not appear within 10s" >&2
+exit 1
