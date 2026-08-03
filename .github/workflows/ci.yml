@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Prove the stdlib-only floor (3.8) and a current version.
+        python-version: ["3.8", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile
+        run: python3 -m py_compile bin/vm
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+
+# NOTE: the live end-to-end smoke test (`vm new` boots a real microVM) needs a
+# KVM host. GitHub-hosted runners have no nested virtualization, so it is NOT run
+# here — run it on a self-hosted KVM runner or manually (`vm doctor` must pass).
