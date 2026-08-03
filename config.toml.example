@@ -1,0 +1,12 @@
+# lilexe config — copy to ~/.lilexe/config.toml
+# Flat key = value only (parsed stdlib-only; no nested tables).
+
+# Defaults applied to `vm new` when the matching flag is omitted.
+cpus = 2
+memory = "2G"
+ttl = "8h"
+idle_timeout = "20m"
+
+# Caps — a `vm new` request above these is clamped down (with a warning).
+max_cpus = 4
+max_memory = "8G"
