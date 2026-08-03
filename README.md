@@ -76,6 +76,7 @@ vm run -- python3 -c 'print("ran in a throwaway microVM")'
 | `vm ssh NAME [-- CMD]` | Interactive shell (or one-shot command) |
 | `vm run [--image I] -- CMD…` | Ephemeral box: boot, run, discard |
 | `vm rebuild NAME [--image X]` | Recreate a box on a new/updated image, keeping its home volume |
+| `vm agent [NAME] [--workspace D\|--clone URL] [--agents-file F] -- task` | Run a coding agent (Claude Code) in a box against a mounted workspace |
 | `vm expose NAME [--public]` | Publish the box over HTTPS (tailnet, or Funnel with `--public`) |
 | `vm unexpose NAME` | Stop publishing |
 | `vm url NAME` | Print the published URL |
@@ -173,6 +174,25 @@ data is preserved and a bare `vm rebuild NAME` retries.
   clamp an over-limit `vm new`. Precedence: CLI flag > config > built-in. See
   [`config.toml.example`](config.toml.example).
 
+## Agent-in-a-box
+
+`vm agent` runs a coding agent (Claude Code) **inside** a microVM against a
+mounted workspace — safe by construction, since AI-generated code runs behind
+the KVM boundary, not on your host.
+
+```bash
+vm agent -- "add a test for the parser"        # agent works in the current dir
+vm agent --clone https://github.com/you/repo -- "fix the failing CI"
+vm agent --agents-file ./AGENTS.md -- "..."     # pass repo agent instructions
+```
+
+The workspace is bind-mounted at `/workspace`, so the agent's edits appear on
+the host **as it works** — retrieve them directly (or `vm expose` what it built).
+Bring your own key: `export ANTHROPIC_API_KEY=…` and it's injected via
+microsandbox secret injection (`--secret`) — sent only to `api.anthropic.com`
+and **never written into the box's image or state**. Override with
+`--key-env`/`--key-host`.
+
 ## What this POC does *not* do (yet)
 
 - **No auth on published endpoints** beyond what your tailnet already enforces.
@@ -181,8 +201,6 @@ data is preserved and a bare `vm rebuild NAME` retries.
   mean re-creating the box (microsandbox fixes published ports at boot).
 - **No custom domains / per-box DNS names.** Boxes are distinguished by HTTPS
   port, not hostname (a Caddy vhost layer could add this).
-- **No built-in agent** (exe.dev's "Shelley"). Drop your own agent in with
-  `vm ssh` / `vm exec`.
 - **Not multi-tenant.** Single user, single host.
 
 ## License
