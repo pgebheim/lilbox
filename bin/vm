@@ -216,14 +216,25 @@ def gen_box_name(con):
     die("could not generate a unique box name")
 
 
-def _create_box_argv(name, host_port, guest_port, image, volume,
-                     cpus=None, memory=None, idle_timeout=None):
-    """Assemble the `msb create` argv for a box (shared by new + rebuild)."""
+def _create_box_argv(name, host_port, guest_port, image, volume=None,
+                     cpus=None, memory=None, idle_timeout=None,
+                     mount_dir=None, workdir=None, secret=None, env=None):
+    """Assemble the `msb create` argv for a box (shared by new, rebuild, agent)."""
     argv = ["create", "--net", "public",
             "--port", f"{host_port}:{guest_port}", "--name", name]
     if volume:
         # --mount-named auto-creates the volume on first boot.
         argv += ["--mount-named", f"{volume}:{DEFAULT_HOME}"]
+    if mount_dir:
+        argv += ["--mount-dir", mount_dir]
+    if workdir:
+        argv += ["-w", workdir]
+    for kv in (env or []):
+        argv += ["-e", kv]
+    if secret:
+        # msb injects the secret only into outbound TLS to the allow-listed host;
+        # it never lands in the guest env, the image, or our state db.
+        argv += ["--secret", secret, "--on-secret-violation", "block-and-log"]
     if cpus:
         argv += ["--cpus", str(cpus)]
     if memory:
@@ -526,6 +537,30 @@ def split_ddash(argv):
 # Commands
 # --------------------------------------------------------------------------
 
+def build_create_args(name, host_port, guest_port, image, cpus=None, memory=None,
+                      mount_dir=None, workdir=None, secret=None, env=None):
+    """Assemble the `msb create` argv (shared by `vm new` and `vm agent`)."""
+    argv = ["create", "--net", "public", "--port", f"{host_port}:{guest_port}"]
+    if name:
+        argv += ["--name", name]
+    if mount_dir:
+        argv += ["--mount-dir", mount_dir]
+    if workdir:
+        argv += ["-w", workdir]
+    for kv in (env or []):
+        argv += ["-e", kv]
+    if secret:
+        # msb injects the secret into outbound TLS to the allow-listed host only;
+        # it never lands in the guest env, the image, or our state db.
+        argv += ["--secret", secret, "--on-secret-violation", "block-and-log"]
+    if cpus:
+        argv += ["--cpus", str(cpus)]
+    if memory:
+        argv += ["--memory", memory]
+    argv.append(image)
+    return argv
+
+
 def cmd_new(args):
     con = db()
     # Name the box up front (generating one when omitted) so a persistent
@@ -615,6 +650,138 @@ def cmd_provision(args):
         info(f"template '{tmpl['name']}' has no setup script — nothing to run")
         return
     provision(args.name, tmpl)
+
+
+AGENT_WORKDIR = "/workspace"
+
+# Ensure the coding agent (Claude Code) is installed in the box, on PATH.
+# Idempotent; installs curl first if the base image lacks it.
+_AGENT_INSTALL = (
+    "command -v claude >/dev/null 2>&1 && exit 0; "
+    "command -v curl >/dev/null 2>&1 || "
+    "(apt-get update -qq && apt-get install -y -qq curl) 2>/dev/null || "
+    "apk add --no-cache curl 2>/dev/null || true; "
+    "curl -fsSL https://claude.ai/install.sh | bash; "
+    "[ -x \"$HOME/.local/bin/claude\" ] && "
+    "ln -sf \"$HOME/.local/bin/claude\" /usr/local/bin/claude 2>/dev/null || true"
+)
+
+
+def _install_agent(name):
+    info(f"installing agent (claude) in {bold(name)} …")
+    rc, out, err = msb("exec", name, "--", "sh", "-c", _AGENT_INSTALL)
+    if rc != 0:
+        warn(f"agent install reported: {err.strip() or out.strip()}")
+
+
+def _resolve_workspace(args):
+    """The host dir to bind-mount at /workspace: a fresh --clone, an explicit
+    --workspace, or the current directory. Edits there ARE the result — the
+    mount is live, so the agent's changes appear on the host as it works."""
+    if args.clone:
+        repo = args.clone.rstrip("/").rsplit("/", 1)[-1]
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        dest = os.path.join(STATE_DIR, "workspaces", repo or "repo")
+        if os.path.exists(dest):
+            die(f"clone target already exists: {dest} (remove it, or use --workspace)")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        info(f"cloning {args.clone} → {dim(dest)} …")
+        rc, out, err = run(["git", "clone", "--depth", "1", args.clone, dest])
+        if rc != 0:
+            die(f"git clone failed: {err.strip() or out.strip()}")
+        return dest
+    ws = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
+    if not os.path.isdir(ws):
+        die(f"workspace not found: {ws}")
+    return ws
+
+
+def cmd_agent(args):
+    con = db()
+    name = args.name
+    if name and get_box(con, name):
+        die(f"box '{name}' already exists")
+
+    workspace = _resolve_workspace(args)
+
+    # BYO-key injection. The real key is read from the host env var and injected
+    # by msb only into outbound TLS to the allow-listed host — it never lands in
+    # the guest env, the image, or our state db. The guest env holds only msb's
+    # placeholder ($MSB_<ENV>) so the agent emits a request msb can rewrite.
+    env, secret = [], None
+    if os.environ.get(args.key_env):
+        env.append(f"{args.key_env}=$MSB_{args.key_env}")
+        secret = f"{args.key_env}@{args.key_host}"
+    else:
+        warn(f"{args.key_env} is not set on the host — the box boots, but the "
+             f"agent can't authenticate until you export {args.key_env}.")
+
+    host_port = alloc_host_port()
+    create = _create_box_argv(name, host_port, DEFAULT_GUEST_PORT, args.image,
+                              mount_dir=f"{workspace}:{AGENT_WORKDIR}",
+                              workdir=AGENT_WORKDIR, env=env, secret=secret)
+    info(f"booting agent box"
+         + (f" {bold(name)}" if name else "")
+         + f" ({args.image}, workspace {dim(workspace)}) …")
+    rc, out, err = msb(*create)
+    if rc != 0:
+        die(f"microsandbox create failed: {err.strip() or out.strip()}")
+
+    if not name:
+        known = {r["name"] for r in con.execute("SELECT name FROM boxes")}
+        for n in live_status():
+            if n not in known:
+                name = n
+                break
+        if not name:
+            die("created a box but could not determine its name (see: msb ls)")
+
+    con.execute(
+        "INSERT OR REPLACE INTO boxes"
+        "(name,image,guest_port,host_port,created,comment) VALUES(?,?,?,?,?,?)",
+        (name, args.image, DEFAULT_GUEST_PORT, host_port,
+         time.strftime("%Y-%m-%d %H:%M:%S"), "agent"),
+    )
+    con.commit()
+
+    _install_agent(name)
+
+    # AGENTS.md passthrough: copy an explicit --agents-file into /workspace so
+    # the agent reads it. (A workspace that already ships AGENTS.md needs none.)
+    if args.agents_file:
+        src = os.path.abspath(args.agents_file)
+        if not os.path.isfile(src):
+            die(f"AGENTS.md not found: {src}")
+        # /workspace is a live bind-mount, so this writes through to the host
+        # workspace dir. Warn before clobbering a workspace's own AGENTS.md.
+        target = os.path.join(workspace, "AGENTS.md")
+        if os.path.exists(target) and os.path.abspath(target) != src:
+            warn(f"overwriting existing AGENTS.md in {workspace}")
+        rc, out, err = msb("copy", src, f"{name}:{AGENT_WORKDIR}/AGENTS.md")
+        if rc != 0:
+            warn(f"could not pass AGENTS.md: {err.strip() or out.strip()}")
+        else:
+            info(f"passed {os.path.basename(src)} → {AGENT_WORKDIR}/AGENTS.md")
+
+    ok(f"agent box {bold(name)} ready (workspace mounted at {AGENT_WORKDIR})")
+
+    task = " ".join(args.cmd) if args.cmd else None
+    if task:
+        info(f"running task: {dim(task)}")
+        # The microVM is the sandbox, so the agent runs unattended inside it.
+        # IS_SANDBOX=1 lets Claude Code skip permission prompts as root (it
+        # refuses otherwise). The task is passed as $1, never shell-interpolated,
+        # so metacharacters in it can't inject.
+        exec_replace([
+            MSB, "exec", "-w", AGENT_WORKDIR, name, "--",
+            "sh", "-c",
+            'IS_SANDBOX=1 exec claude -p "$1" --dangerously-skip-permissions',
+            "sh", task,
+        ])
+    else:
+        print(dim(f"  vm exec {name} -- claude -p \"<task>\"   run a task"))
+        print(dim(f"  edits land in {workspace}"))
 
 
 def cmd_ls(args):
@@ -1072,6 +1239,23 @@ def build_parser():
     ur.add_argument("name")
     ur.set_defaults(func=cmd_url)
 
+    ag = sub.add_parser("agent",
+                        help="run a coding agent in a box against a workspace  (vm agent [NAME] -- task)")
+    ag.add_argument("name", nargs="?", help="box name (auto-generated if omitted)")
+    ag.add_argument("--image", default=DEFAULT_IMAGE, help="base image")
+    ag_ws = ag.add_mutually_exclusive_group()
+    ag_ws.add_argument("--workspace",
+                       help="host dir to mount at /workspace (default: current dir)")
+    ag_ws.add_argument("--clone", metavar="URL",
+                       help="git clone URL into ~/.lilexe/workspaces/ and mount that")
+    ag.add_argument("--agents-file", metavar="PATH",
+                    help="copy an AGENTS.md into the box's /workspace")
+    ag.add_argument("--key-env", default="ANTHROPIC_API_KEY",
+                    help="host env var holding the agent's API key (default: ANTHROPIC_API_KEY)")
+    ag.add_argument("--key-host", default="api.anthropic.com",
+                    help="host the injected key may be sent to (default: api.anthropic.com)")
+    ag.set_defaults(func=cmd_agent)
+
     d = sub.add_parser("doctor", help="check the local runtime")
     d.set_defaults(func=cmd_doctor)
 
@@ -1085,7 +1269,7 @@ def main():
 
     argv = sys.argv[1:]
     # Commands that take a passthrough command after `--`.
-    passthrough = {"exec", "ssh", "run"}
+    passthrough = {"exec", "ssh", "run", "agent"}
     parser = build_parser()
     if argv and argv[0] in passthrough:
         before, after = split_ddash(argv)
