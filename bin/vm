@@ -383,6 +383,26 @@ def cmd_run(args):
     exec_replace(cmd)
 
 
+def cmd_cp(args):
+    # Thin passthrough to `msb copy`. Use NAME:/abs/path for the box side, e.g.
+    #   vm cp ./file web:/root/file      (host -> box)
+    #   vm cp web:/root/out ./out        (box  -> host)
+    exec_replace([MSB, "copy", args.src, args.dst])
+
+
+def cmd_logs(args):
+    con = db()
+    require_box(con, args.name)
+    cmd = [MSB, "logs", args.name]
+    if args.follow:
+        cmd.append("--follow")
+    if args.tail is not None:
+        cmd += ["--tail", str(args.tail)]
+    if args.source:
+        cmd += ["--source", args.source]
+    exec_replace(cmd)
+
+
 def cmd_expose(args):
     if not TS:
         die("tailscale not found — cannot publish")
@@ -570,6 +590,18 @@ def build_parser():
     r = sub.add_parser("run", help="ephemeral box: boot, run, discard")
     r.add_argument("--image", default=DEFAULT_IMAGE)
     r.set_defaults(func=cmd_run)
+
+    cp = sub.add_parser("cp", help="copy files to/from a box  (vm cp SRC DST; box side = NAME:/path)")
+    cp.add_argument("src")
+    cp.add_argument("dst")
+    cp.set_defaults(func=cmd_cp)
+
+    lg = sub.add_parser("logs", help="show a box's captured output")
+    lg.add_argument("name")
+    lg.add_argument("-f", "--follow", action="store_true", help="stream new output")
+    lg.add_argument("--tail", type=int, help="only the last N lines")
+    lg.add_argument("--source", help="stdout,stderr (default), system, or all")
+    lg.set_defaults(func=cmd_logs)
 
     x = sub.add_parser("expose", help="publish a box to your tailnet (HTTPS)")
     x.add_argument("name")
