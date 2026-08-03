@@ -26,6 +26,7 @@ import time
 HOME = os.path.expanduser("~")
 STATE_DIR = os.path.join(HOME, ".lilexe")
 DB_PATH = os.path.join(STATE_DIR, "state.db")
+CONFIG_PATH = os.path.join(STATE_DIR, "config.toml")
 
 DEFAULT_IMAGE = "python"
 DEFAULT_GUEST_PORT = 8000
@@ -177,6 +178,31 @@ def require_box(con, name):
     return row
 
 
+def parse_config(text):
+    """A tiny flat-TOML subset (stdlib-only; tomllib is 3.11+): `key = value`
+    lines, `#` comments, quotes stripped, bare ints coerced. Sections ignored."""
+    cfg = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("[") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip().split("#", 1)[0].strip().strip('"').strip("'")
+        cfg[k] = int(v) if v.isdigit() else v
+    return cfg
+
+
+def load_config():
+    """Read ~/.lilexe/config.toml → dict of defaults (empty if absent)."""
+    if not os.path.isfile(CONFIG_PATH):
+        return {}
+    try:
+        with open(CONFIG_PATH) as f:
+            return parse_config(f.read())
+    except OSError as e:
+        die(f"could not read {CONFIG_PATH}: {e}")
+
+
 # --------------------------------------------------------------------------
 # Tailscale helpers
 # --------------------------------------------------------------------------
@@ -284,18 +310,24 @@ def cmd_new(args):
     if name and get_box(con, name):
         die(f"box '{name}' already exists")
 
+    # Defaults from ~/.lilexe/config.toml. Precedence: CLI flag > config > built-in.
+    cfg = load_config()
+    image = args.image or cfg.get("image") or DEFAULT_IMAGE
+    guest_port = args.port or cfg.get("port") or DEFAULT_GUEST_PORT
+    cpus = args.cpus or cfg.get("cpus")
+    memory = args.memory or cfg.get("memory")
+
     host_port = alloc_host_port()
-    guest_port = args.port
     create = ["create", "--net", "public", "--port", f"{host_port}:{guest_port}"]
     if name:
         create += ["--name", name]
-    if args.cpus:
-        create += ["--cpus", str(args.cpus)]
-    if args.memory:
-        create += ["--memory", args.memory]
-    create.append(args.image)
+    if cpus:
+        create += ["--cpus", str(cpus)]
+    if memory:
+        create += ["--memory", str(memory)]
+    create.append(image)
 
-    info(f"booting {bold(args.image)} microVM"
+    info(f"booting {bold(image)} microVM"
          + (f" as {bold(name)}" if name else "") + " …")
     rc, out, err = msb(*create)
     if rc != 0:
@@ -314,11 +346,11 @@ def cmd_new(args):
     con.execute(
         "INSERT OR REPLACE INTO boxes(name,image,guest_port,host_port,created) "
         "VALUES(?,?,?,?,?)",
-        (name, args.image, guest_port, host_port,
+        (name, image, guest_port, host_port,
          time.strftime("%Y-%m-%d %H:%M:%S")),
     )
     con.commit()
-    ok(f"box {bold(name)} is up ({args.image}, guest :{guest_port})")
+    ok(f"box {bold(name)} is up ({image}, guest :{guest_port})")
     print(dim(f"  vm exec {name} -- <cmd>     run a command"))
     print(dim(f"  vm ssh {name}               open a shell"))
     print(dim(f"  vm expose {name}            publish :{guest_port} to your tailnet"))
@@ -567,10 +599,10 @@ def build_parser():
 
     n = sub.add_parser("new", help="create a new box (persistent microVM)")
     n.add_argument("name", nargs="?", help="box name (auto-generated if omitted)")
-    n.add_argument("--image", default=DEFAULT_IMAGE,
-                   help=f"image (default: {DEFAULT_IMAGE})")
-    n.add_argument("--port", type=int, default=DEFAULT_GUEST_PORT,
-                   help=f"guest web port to publish (default: {DEFAULT_GUEST_PORT})")
+    n.add_argument("--image", default=None,
+                   help=f"image (default: {DEFAULT_IMAGE}, or config)")
+    n.add_argument("--port", type=int, default=None,
+                   help=f"guest web port to publish (default: {DEFAULT_GUEST_PORT}, or config)")
     n.add_argument("--cpus", type=int, help="vCPUs")
     n.add_argument("--memory", help="memory, e.g. 1G")
     n.set_defaults(func=cmd_new)
