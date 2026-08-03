@@ -67,19 +67,21 @@ vm run -- python3 -c 'print("ran in a throwaway microVM")'
 
 | Command | Does |
 |---|---|
-| `vm new [NAME] [--template T] [--image I] [--port P] [--cpus N] [--memory M] [--rebuild]` | Boot a persistent box (default image `python`, publishes guest port `8000`) |
+| `vm new [NAME] [--template T] [--image I] [--port P] [--cpus N] [--memory M] [--rebuild] [--no-persist] [--volume V]` | Boot a persistent box (default image `python`, guest port `8000`, persistent `/root` home) |
 | `vm templates` | List available box templates |
 | `vm provision NAME` | Re-run a box's template setup script |
 | `vm ls` | List boxes with live status + published URLs |
 | `vm exec NAME -- CMD…` | Run a command inside a box |
 | `vm ssh NAME [-- CMD]` | Interactive shell (or one-shot command) |
 | `vm run [--image I] -- CMD…` | Ephemeral box: boot, run, discard |
+| `vm rebuild NAME [--image X]` | Recreate a box on a new/updated image, keeping its home volume |
 | `vm expose NAME [--public]` | Publish the box over HTTPS (tailnet, or Funnel with `--public`) |
 | `vm unexpose NAME` | Stop publishing |
 | `vm url NAME` | Print the published URL |
 | `vm stop/start/restart NAME` | Lifecycle |
 | `vm fork NAME [NEWNAME]` | Snapshot a box and boot a clone from it |
-| `vm rm NAME` | Remove a box (and unpublish it) |
+| `vm volumes` | List persistent home volumes (and orphans) |
+| `vm rm NAME [--keep-data]` | Remove a box + unpublish; deletes its home volume unless `--keep-data` |
 | `vm stat NAME` | Detailed box info |
 | `vm doctor` | Check msb + tailscale + tailnet |
 
@@ -137,6 +139,26 @@ vm exec mybox -- tailscale version  # tailscale is baked in
 ```
 
 See [`images/lilexe-box/README.md`](images/lilexe-box/README.md) for details.
+
+## Persistent volumes (devboxes)
+
+Every `vm new` box gets a named msb volume `lilexe-<name>-home` mounted at
+`/root`, so its home **survives `vm stop`/`start` and image swaps** — a sandbox
+becomes a devbox. Pass `--no-persist` for a throwaway home (`vm run` is always
+ephemeral).
+
+```bash
+vm new dev                     # persistent /root by default
+vm rebuild dev --image python  # swap the image, keep the home data
+vm rm dev --keep-data          # remove the box but preserve its volume
+vm new dev                     # a same-named box re-attaches it
+vm new dev2 --volume lilexe-dev-home   # or adopt it explicitly by name
+vm volumes                     # list volumes (orphans flagged)
+```
+
+`vm rm` **deletes the home volume by default** (unless `--keep-data`, or another
+box still uses it). `vm rebuild` never touches the volume — on a boot failure the
+data is preserved and a bare `vm rebuild NAME` retries.
 
 ## What this POC does *not* do (yet)
 

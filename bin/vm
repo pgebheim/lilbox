@@ -29,6 +29,8 @@ DB_PATH = os.path.join(STATE_DIR, "state.db")
 
 DEFAULT_IMAGE = "python"
 DEFAULT_GUEST_PORT = 8000
+DEFAULT_HOME = "/root"           # where a box's persistent volume mounts
+# TODO(template): make the home path template-derived once #8 lands non-root users
 SERVE_PORT_BASE = 8443           # tailnet HTTPS ports we hand out (avoid 443 = caddy)
 SERVE_PORT_MAX = 8480
 FUNNEL_PORTS = {443, 8443, 10000}  # ports Tailscale Funnel is allowed to use
@@ -170,14 +172,16 @@ def db():
             url        TEXT,
             created    TEXT,
             comment    TEXT,
-            template   TEXT
+            template   TEXT,
+            volume     TEXT
         )
         """
     )
-    # Migrate pre-existing DBs that predate the `template` column.
+    # Migrate pre-existing DBs that predate newer columns.
     cols = {r[1] for r in con.execute("PRAGMA table_info(boxes)")}
-    if "template" not in cols:
-        con.execute("ALTER TABLE boxes ADD COLUMN template TEXT")
+    for col, decl in (("template", "TEXT"), ("volume", "TEXT")):
+        if col not in cols:
+            con.execute(f"ALTER TABLE boxes ADD COLUMN {col} {decl}")
     return con
 
 
@@ -190,6 +194,38 @@ def require_box(con, name):
     if not row:
         die(f"no box named '{name}' (see: vm ls)")
     return row
+
+
+def volume_name_for(box):
+    """The named msb volume that backs a box's home, e.g. lilexe-web-home."""
+    return f"lilexe-{box}-home"
+
+
+def gen_box_name(con):
+    """A unique box name. We name boxes up front (rather than letting msb
+    auto-generate) so a persistent volume can be attached at create time."""
+    known = {r["name"] for r in con.execute("SELECT name FROM boxes")} | set(live_status())
+    for _ in range(100):
+        cand = f"box-{os.urandom(3).hex()}"
+        if cand not in known:
+            return cand
+    die("could not generate a unique box name")
+
+
+def _create_box_argv(name, host_port, guest_port, image, volume,
+                     cpus=None, memory=None):
+    """Assemble the `msb create` argv for a box (shared by new + rebuild)."""
+    argv = ["create", "--net", "public",
+            "--port", f"{host_port}:{guest_port}", "--name", name]
+    if volume:
+        # --mount-named auto-creates the volume on first boot.
+        argv += ["--mount-named", f"{volume}:{DEFAULT_HOME}"]
+    if cpus:
+        argv += ["--cpus", str(cpus)]
+    if memory:
+        argv += ["--memory", memory]
+    argv.append(image)
+    return argv
 
 
 # --------------------------------------------------------------------------
@@ -438,8 +474,10 @@ def split_ddash(argv):
 
 def cmd_new(args):
     con = db()
-    name = args.name
-    if name and get_box(con, name):
+    # Name the box up front (generating one when omitted) so a persistent
+    # volume can be attached at create time.
+    name = args.name or gen_box_name(con)
+    if get_box(con, name):
         die(f"box '{name}' already exists")
 
     tmpl = load_template(args.template) if args.template else None
@@ -458,42 +496,34 @@ def cmd_new(args):
     cpus = args.cpus or (tmpl and tmpl["cpus"])
     memory = args.memory or (tmpl and tmpl["memory"])
 
+    # Persist by default. --no-persist opts out; --volume attaches a specific
+    # existing volume (e.g. one kept via `vm rm --keep-data`).
+    if args.no_persist:
+        volume = None
+    else:
+        volume = args.volume or volume_name_for(name)
+
     host_port = alloc_host_port()
-    create = ["create", "--net", "public", "--port", f"{host_port}:{guest_port}"]
-    if name:
-        create += ["--name", name]
-    if cpus:
-        create += ["--cpus", str(cpus)]
-    if memory:
-        create += ["--memory", memory]
-    create.append(image)
+    create = _create_box_argv(name, host_port, guest_port, image, volume, cpus, memory)
 
     label = bold(image) + (dim(f" via {tmpl['name']}") if tmpl else "")
-    info(f"booting {label} microVM"
-         + (f" as {bold(name)}" if name else "") + " …")
+    info(f"booting {label} microVM as {bold(name)}"
+         + (dim(" (persistent)") if volume else "") + " …")
     rc, out, err = msb(*create)
     if rc != 0:
         die(f"microsandbox create failed: {err.strip() or out.strip()}")
 
-    # msb auto-generates a name when --name is omitted; discover it.
-    if not name:
-        known = {r["name"] for r in con.execute("SELECT name FROM boxes")}
-        for n in live_status():
-            if n not in known:
-                name = n
-                break
-        if not name:
-            die("created a box but could not determine its name (see: msb ls)")
-
     con.execute(
         "INSERT OR REPLACE INTO boxes"
-        "(name,image,guest_port,host_port,created,template) "
-        "VALUES(?,?,?,?,?,?)",
+        "(name,image,guest_port,host_port,created,template,volume) "
+        "VALUES(?,?,?,?,?,?,?)",
         (name, image, guest_port, host_port,
-         time.strftime("%Y-%m-%d %H:%M:%S"), tmpl["name"] if tmpl else None),
+         time.strftime("%Y-%m-%d %H:%M:%S"),
+         tmpl["name"] if tmpl else None, volume),
     )
     con.commit()
-    ok(f"box {bold(name)} is up ({image}, guest :{guest_port})")
+    persist = f", home persists in {volume}" if volume else ""
+    ok(f"box {bold(name)} is up ({image}, guest :{guest_port}{persist})")
 
     # Post-boot provisioning: run the template's setup script (if any). The box
     # is already booted and reachable via msb exec, so this runs immediately.
@@ -644,7 +674,26 @@ def cmd_rm(args):
         warn(f"msb rm reported: {err.strip() or out.strip()}")
     con.execute("DELETE FROM boxes WHERE name=?", (args.name,))
     con.commit()
-    ok(f"removed {bold(args.name)}")
+
+    # By default rm also deletes the box's home volume (its data). --keep-data
+    # preserves it so a future box of the same name re-attaches it.
+    vol = row["volume"]
+    # This box's row is already gone, so any remaining reference is another box
+    # that adopted the same volume (via `vm new --volume`) — never delete it.
+    shared = vol and con.execute(
+        "SELECT 1 FROM boxes WHERE volume=? LIMIT 1", (vol,)).fetchone()
+    if vol and args.keep_data:
+        ok(f"removed {bold(args.name)} — kept volume {cyan(vol)}")
+        print(dim(f"  vm new {args.name}   re-attaches it"))
+    elif vol and shared:
+        ok(f"removed {bold(args.name)} — kept volume {cyan(vol)} (still used by another box)")
+    elif vol:
+        rc, out, err = msb("volume", "remove", vol)
+        if rc != 0 and "not found" not in (err + out).lower():
+            warn(f"could not remove volume {vol}: {err.strip() or out.strip()}")
+        ok(f"removed {bold(args.name)} (and its home volume)")
+    else:
+        ok(f"removed {bold(args.name)}")
 
 
 def cmd_fork(args):
@@ -683,6 +732,77 @@ def cmd_fork(args):
     )
     con.commit()
     ok(f"forked {bold(args.name)} → {bold(new)}")
+
+
+def cmd_rebuild(args):
+    con = db()
+    row = require_box(con, args.name)
+    if not row["volume"]:
+        die(f"box '{args.name}' has no persistent volume — nothing to preserve "
+            f"across a rebuild. (Recreate it with: vm new {args.name})")
+    name = args.name
+    new_image = args.image or row["image"]
+
+    info(f"rebuilding {bold(name)} on {bold(new_image)} "
+         f"(home volume {row['volume']} preserved) …")
+    # Tear down the box but KEEP its volume (msb rm does not touch volumes).
+    msb("stop", name)  # best effort
+    rc, out, err = msb("rm", name)
+    if rc != 0 and "not found" not in (err + out).lower():
+        die(f"could not remove the old box: {err.strip() or out.strip()}")
+
+    # Recreate with the SAME name, host port, and volume — new image. Reusing
+    # host_port keeps any existing `vm expose` mapping valid.
+    create = _create_box_argv(name, row["host_port"], row["guest_port"],
+                              new_image, row["volume"])
+    rc, out, err = msb(*create)
+    if rc != 0:
+        # The box row still records the old image, so a bare retry re-boots it.
+        die(f"rebuild failed to boot the new box — your data is safe in volume "
+            f"{row['volume']}. Retry with: vm rebuild {name}\n  "
+            f"{err.strip() or out.strip()}")
+
+    con.execute("UPDATE boxes SET image=? WHERE name=?", (new_image, name))
+    con.commit()
+    ok(f"rebuilt {bold(name)} on {new_image} (home data intact)")
+
+
+def _human_bytes(n):
+    if not isinstance(n, int):
+        return "—"
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024:
+            return f"{n}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}P"
+
+
+def cmd_volumes(args):
+    con = db()
+    rc, out, _ = msb("volume", "list", "--format", "json")
+    vols = []
+    if rc == 0 and out.strip():
+        try:
+            vols = json.loads(out)
+        except Exception:
+            vols = []
+    # Which box owns each volume (a volume with no owning row is an orphan —
+    # e.g. left behind by `vm rm --keep-data`).
+    owner = {r["volume"]: r["name"] for r in con.execute(
+        "SELECT name, volume FROM boxes WHERE volume IS NOT NULL")}
+    # lilexe-managed volumes, plus any volume a box adopted via `vm new --volume`.
+    rows = [v for v in vols
+            if str(v.get("name", "")).startswith("lilexe-") or v.get("name") in owner]
+    if not rows:
+        print(dim("no lilexe volumes yet — `vm new` creates one per box"))
+        return
+    name_w = max(6, max(len(v["name"]) for v in rows))
+    print(bold(f"{'VOLUME':<{name_w}}  {'BOX':<14}  USED"))
+    for v in sorted(rows, key=lambda v: v["name"]):
+        vn = v["name"]
+        box = owner.get(vn) or red("orphan")
+        pad = " " * max(0, 14 - len(box if owner.get(vn) else "orphan"))
+        print(f"{vn:<{name_w}}  {box}{pad}  {_human_bytes(v.get('used_bytes'))}")
 
 
 def cmd_stat(args):
@@ -751,6 +871,10 @@ def build_parser():
     n.add_argument("--memory", help="memory, e.g. 1G")
     n.add_argument("--rebuild", action="store_true",
                    help="rebuild a Dockerfile template's image (ignore the cache)")
+    n.add_argument("--no-persist", action="store_true",
+                   help="don't attach a persistent home volume (ephemeral home)")
+    n.add_argument("--volume",
+                   help="attach a specific existing volume (e.g. one kept via rm --keep-data)")
     n.set_defaults(func=cmd_new)
 
     l = sub.add_parser("ls", help="list boxes")
@@ -789,17 +913,31 @@ def build_parser():
         ("stop", cmd_stop, "stop a running box"),
         ("start", cmd_start, "start a stopped box"),
         ("restart", cmd_restart, "restart a box"),
-        ("rm", cmd_rm, "remove a box (and unpublish it)"),
         ("stat", cmd_stat, "show detailed box info"),
     ):
         sp = sub.add_parser(verb, help=helptxt)
         sp.add_argument("name")
         sp.set_defaults(func=fn)
 
+    rmp = sub.add_parser("rm", help="remove a box (unpublish + delete its home volume)")
+    rmp.add_argument("name")
+    rmp.add_argument("--keep-data", action="store_true",
+                     help="preserve the box's home volume (default: delete it)")
+    rmp.set_defaults(func=cmd_rm)
+
+    vol = sub.add_parser("volumes", help="list persistent home volumes")
+    vol.set_defaults(func=cmd_volumes)
+
     f = sub.add_parser("fork", help="snapshot a box and boot a clone (experimental)")
     f.add_argument("name")
     f.add_argument("newname", nargs="?")
     f.set_defaults(func=cmd_fork)
+
+    rb = sub.add_parser("rebuild",
+                        help="recreate a box on a new/updated image, keeping its home volume")
+    rb.add_argument("name")
+    rb.add_argument("--image", help="new image (default: the box's current image)")
+    rb.set_defaults(func=cmd_rebuild)
 
     ur = sub.add_parser("url", help="print a box's published URL")
     ur.add_argument("name")
