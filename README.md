@@ -67,10 +67,11 @@ vm run -- python3 -c 'print("ran in a throwaway microVM")'
 
 | Command | Does |
 |---|---|
-| `vm new [NAME] [--template T] [--image I] [--port P] [--cpus N] [--memory M] [--rebuild] [--no-persist] [--volume V]` | Boot a persistent box (default image `python`, guest port `8000`, persistent `/root` home) |
+| `vm new [NAME] [--template T] [--image I] [--port P] [--cpus N] [--memory M] [--rebuild] [--no-persist] [--volume V] [--ttl D] [--idle-timeout D]` | Boot a persistent box (default image `python`, guest port `8000`, persistent `/root` home) |
 | `vm templates` | List available box templates |
 | `vm provision NAME` | Re-run a box's template setup script |
 | `vm ls` | List boxes with live status + published URLs |
+| `vm gc` | Reap boxes whose `--ttl` has elapsed (cron-friendly) |
 | `vm exec NAME -- CMD…` | Run a command inside a box |
 | `vm ssh NAME [-- CMD]` | Interactive shell (or one-shot command) |
 | `vm run [--image I] -- CMD…` | Ephemeral box: boot, run, discard |
@@ -159,6 +160,18 @@ vm volumes                     # list volumes (orphans flagged)
 `vm rm` **deletes the home volume by default** (unless `--keep-data`, or another
 box still uses it). `vm rebuild` never touches the volume — on a boot failure the
 data is preserved and a bare `vm rebuild NAME` retries.
+
+## Lifecycle & config (cheap when idle)
+
+- **TTL:** `vm new web --ttl 2h` auto-expires the box; `vm gc` (run it from cron)
+  reaps expired boxes. `vm run --ttl 30m` bounds an ephemeral box.
+- **Idle suspend:** `vm new web --idle-timeout 20m` suspends the box after it's
+  idle (frees RAM); `vm exec`/`vm ssh` **transparently resume** it (~1–2s). A box
+  you `vm stop` yourself is never auto-resumed.
+- **Defaults & caps:** `~/.lilexe/config.toml` sets defaults for
+  `cpus`/`memory`/`ttl`/`idle_timeout` and caps (`max_cpus`/`max_memory`) that
+  clamp an over-limit `vm new`. Precedence: CLI flag > config > built-in. See
+  [`config.toml.example`](config.toml.example).
 
 ## What this POC does *not* do (yet)
 
