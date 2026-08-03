@@ -70,10 +70,12 @@ vm run -- python3 -c 'print("ran in a throwaway microVM")'
 | `vm new [NAME] [--template T] [--image I] [--port P] [--cpus N] [--memory M] [--rebuild] [--no-persist] [--volume V] [--ttl D] [--idle-timeout D]` | Boot a persistent box (default image `python`, guest port `8000`, persistent `/root` home) |
 | `vm templates` | List available box templates |
 | `vm provision NAME` | Re-run a box's template setup script |
-| `vm ls` | List boxes with live status + published URLs |
+| `vm ls [--json]` | List boxes with live status + published URLs (`--json` for scripting) |
 | `vm gc` | Reap boxes whose `--ttl` has elapsed (cron-friendly) |
 | `vm exec NAME -- CMD…` | Run a command inside a box |
 | `vm ssh NAME [-- CMD]` | Interactive shell (or one-shot command) |
+| `vm cp SRC DST` | Copy files to/from a box (box side = `NAME:/path`) |
+| `vm logs NAME [-f] [--tail N] [--source S]` | Show a box's captured output |
 | `vm run [--image I] -- CMD…` | Ephemeral box: boot, run, discard |
 | `vm rebuild NAME [--image X]` | Recreate a box on a new/updated image, keeping its home volume |
 | `vm agent [NAME] [--workspace D\|--clone URL] [--agents-file F] -- task` | Run a coding agent (Claude Code) in a box against a mounted workspace |
@@ -170,8 +172,9 @@ data is preserved and a bare `vm rebuild NAME` retries.
   idle (frees RAM); `vm exec`/`vm ssh` **transparently resume** it (~1–2s). A box
   you `vm stop` yourself is never auto-resumed.
 - **Defaults & caps:** `~/.lilexe/config.toml` sets defaults for
-  `cpus`/`memory`/`ttl`/`idle_timeout` and caps (`max_cpus`/`max_memory`) that
-  clamp an over-limit `vm new`. Precedence: CLI flag > config > built-in. See
+  `image`/`port`/`cpus`/`memory`/`ttl`/`idle_timeout` and caps
+  (`max_cpus`/`max_memory`) that clamp an over-limit `vm new`. Precedence: CLI
+  flag > template > config > built-in. See
   [`config.toml.example`](config.toml.example).
 
 ## Agent-in-a-box
@@ -192,6 +195,33 @@ Bring your own key: `export ANTHROPIC_API_KEY=…` and it's injected via
 microsandbox secret injection (`--secret`) — sent only to `api.anthropic.com`
 and **never written into the box's image or state**. Override with
 `--key-env`/`--key-host`.
+
+## Configuration
+
+`~/.lilexe/config.toml` sets defaults for `vm new` (flat `key = value`, parsed
+with the stdlib — no `tomllib`/pip needed):
+
+```toml
+image = "python"
+port = 8000
+cpus = 2
+memory = "2G"
+```
+
+Precedence is **CLI flag > config > built-in default**. See
+[`config.toml.example`](config.toml.example).
+
+## Testing
+
+Stdlib `unittest` (no pip); the msb/tailscale boundary is mocked, so it runs
+anywhere:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+CI runs `py_compile` + the suite on Python 3.8 and 3.12. The live end-to-end
+smoke test needs a KVM host and is run manually / on a self-hosted runner.
 
 ## What this POC does *not* do (yet)
 
