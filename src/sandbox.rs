@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use microsandbox::{
     ExecEvent, MicrosandboxError, Sandbox, SecretSource,
-    sandbox::{SandboxBuilder, SandboxStatus},
+    sandbox::{SandboxBuilder, SandboxStatus, SecretBuilder},
 };
 
 use crate::app::App;
@@ -255,15 +255,29 @@ pub(crate) fn configure_builder(
     builder
 }
 
+fn secret_shape(secret: SecretBuilder, env: &str, host: &str) -> SecretBuilder {
+    secret.env(env).allow_host(host)
+}
+
 pub(crate) fn with_secret_env(builder: SandboxBuilder, env: &str, host: &str) -> SandboxBuilder {
     builder.secret(|secret| {
-        secret
-            .env(env)
-            .source(SecretSource::Env {
-                var: env.to_owned(),
-            })
-            .allow_host(host)
+        secret_shape(secret, env, host).source(SecretSource::Env {
+            var: env.to_owned(),
+        })
     })
+}
+
+/// Injects a runtime-minted secret value (e.g. a freshly-minted Tailscale
+/// auth key) that isn't itself a host environment variable, so it must be
+/// carried via `.value()` rather than `.source()`. The value is dropped by
+/// the caller as soon as this builder is built.
+pub(crate) fn with_secret_value(
+    builder: SandboxBuilder,
+    env: &str,
+    value: &str,
+    host: &str,
+) -> SandboxBuilder {
+    builder.secret(|secret| secret_shape(secret, env, host).value(value))
 }
 
 pub(crate) async fn stop_and_remove(name: &str) -> Result<()> {
