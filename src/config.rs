@@ -19,6 +19,10 @@ pub(crate) struct TailscaleConfig {
     pub(crate) tag: Option<String>,
     #[serde(rename = "authKeyEnv")]
     pub(crate) auth_key_env: Option<String>,
+    #[serde(rename = "oauthClientId")]
+    pub(crate) oauth_client_id: Option<String>,
+    #[serde(rename = "oauthClientSecretEnv")]
+    pub(crate) oauth_client_secret_env: Option<String>,
 }
 
 #[cfg(test)]
@@ -35,10 +39,20 @@ mod tests {
 
     #[test]
     fn parses_tailscale_table() {
-        let config: Config =
-            toml::from_str("[tailscale]\ntag = 'tag:custom'\nauthKeyEnv = 'MY_KEY'\n").unwrap();
+        let config: Config = toml::from_str(
+            "[tailscale]\ntag = 'tag:custom'\nauthKeyEnv = 'MY_KEY'\noauthClientId = 'client-123'\noauthClientSecretEnv = 'MY_SECRET'\n",
+        )
+        .unwrap();
         assert_eq!(config.tailscale.tag.as_deref(), Some("tag:custom"));
         assert_eq!(config.tailscale.auth_key_env.as_deref(), Some("MY_KEY"));
+        assert_eq!(
+            config.tailscale.oauth_client_id.as_deref(),
+            Some("client-123")
+        );
+        assert_eq!(
+            config.tailscale.oauth_client_secret_env.as_deref(),
+            Some("MY_SECRET")
+        );
     }
 
     #[test]
@@ -46,5 +60,7 @@ mod tests {
         let config: Config = toml::from_str("").unwrap();
         assert!(config.tailscale.tag.is_none());
         assert!(config.tailscale.auth_key_env.is_none());
+        assert!(config.tailscale.oauth_client_id.is_none());
+        assert!(config.tailscale.oauth_client_secret_env.is_none());
     }
 }

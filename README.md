@@ -169,6 +169,36 @@ Boxes join as **ephemeral** nodes, so a node auto-deregisters once it goes
 offline; `lilbox rm` also logs the node out directly (best-effort) so it's
 removed from the tailnet immediately rather than waiting for it to age out.
 
+### Joining the tailnet: OAuth-minted keys vs. a static auth key
+
+`lilbox new` can join a box to the tailnet two ways, configured under
+`[tailscale]` in `~/.lilbox/config.toml`:
+
+```toml
+[tailscale]
+tag = "tag:lilbox-vm"                       # optional, defaults to tag:lilbox-vm
+oauthClientId = "k123abc..."                 # Tailscale OAuth client ID
+oauthClientSecretEnv = "TS_OAUTH_CLIENT_SECRET"  # optional, this is the default
+# authKeyEnv = "TS_AUTHKEY"                  # static fallback, see below
+```
+
+- **`oauthClientId` (preferred).** `lilbox new` mints a fresh, tagged,
+  single-use, 5-minute-lived auth key per box via the [Tailscale OAuth
+  client-credentials flow](https://tailscale.com/kb/1215/oauth-clients),
+  reading the client secret from the environment variable named by
+  `oauthClientSecretEnv` (default `TS_OAUTH_CLIENT_SECRET`). The OAuth client
+  must **own the tag** it mints for (i.e. be scoped to `tag:lilbox-vm` — not
+  `lilbox`, the tag prefix is required) and hold the `auth_keys` write scope.
+  Nothing is cached: a new key is minted for every `lilbox new`.
+- **`authKeyEnv` (static fallback).** Names an environment variable holding a
+  long-lived, pre-generated auth key (default `TS_AUTHKEY`). Used only when
+  `oauthClientId` isn't configured, or its secret env doesn't resolve.
+
+**Precedence:** OAuth (`oauthClientId` + resolvable secret) > `authKeyEnv` >
+skip the tailnet join entirely. Any minting failure (bad credentials, network
+error, malformed response) only prints a warning and skips the join — it
+never fails `lilbox new`.
+
 ## Persistent volumes (devboxes)
 
 Every `lilbox new` box gets a named microsandbox volume `lilbox-<name>-home` mounted at

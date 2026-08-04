@@ -7,10 +7,11 @@ use rusqlite::params;
 use crate::app::App;
 use crate::cli::NewArgs;
 use crate::provision::{build_template_image, provision};
-use crate::sandbox::{SandboxSettings, configure_builder, with_secret_env};
+use crate::sandbox::{SandboxSettings, configure_builder, with_secret_env, with_secret_value};
 use crate::tailscale::{
-    CONTROL_PLANE_HOST, DEFAULT_AUTH_KEY_ENV, is_valid_env_var_name, node_hostname,
-    require_auth_key, resolve_tag, tailscale_up_command, validate_tag,
+    CONTROL_PLANE_HOST, DEFAULT_AUTH_KEY_ENV, JoinMode, is_valid_env_var_name, mint_ephemeral_key,
+    node_hostname, require_auth_key, resolve_join_mode, resolve_tag, tailscale_up_command,
+    validate_tag,
 };
 use crate::util::{
     DEFAULT_GUEST_PORT, DEFAULT_IMAGE, alloc_host_port, now, parse_duration, parse_memory,
@@ -26,19 +27,52 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
         bail!("box '{name}' already exists");
     }
     let config = app.config()?;
-    let tag = resolve_tag(args.tag.as_deref(), config.tailscale.tag.as_deref());
-    let key_env = config
-        .tailscale
-        .auth_key_env
-        .clone()
-        .unwrap_or_else(|| DEFAULT_AUTH_KEY_ENV.into());
-    let joins_tailnet = if !is_valid_env_var_name(&key_env) {
-        eprintln!(
-            "warning: tailscale authKeyEnv '{key_env}' is not a valid environment variable name; skipping tailnet join"
-        );
-        false
-    } else {
-        require_auth_key(env::var(&key_env).ok(), &key_env).is_ok()
+    let mut tag = resolve_tag(args.tag.as_deref(), config.tailscale.tag.as_deref());
+    let mode = resolve_join_mode(&config.tailscale, args.tag.as_deref(), |name| {
+        env::var(name).ok()
+    });
+    let mut key_env = DEFAULT_AUTH_KEY_ENV.to_string();
+    let mut minted_key: Option<String> = None;
+    let joins_tailnet = match mode {
+        JoinMode::Mint {
+            tag: mint_tag,
+            client_id,
+            client_secret,
+        } => {
+            tag = mint_tag;
+            // A malformed tag from config must not abort `new` (never fail on a
+            // tailnet problem) — warn and skip the join. An explicit --tag is
+            // still hard-validated below for fast feedback.
+            if let Err(error) = validate_tag(&tag) {
+                eprintln!("warning: {error}; skipping tailnet join");
+                false
+            } else {
+                match mint_ephemeral_key(&client_id, &client_secret, &tag, &name).await {
+                    Ok(key) => {
+                        minted_key = Some(key);
+                        true
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "warning: could not mint tailnet auth key: {error}; skipping tailnet join"
+                        );
+                        false
+                    }
+                }
+            }
+        }
+        JoinMode::StaticEnv { key_env: env_name } => {
+            key_env = env_name;
+            if !is_valid_env_var_name(&key_env) {
+                eprintln!(
+                    "warning: tailscale authKeyEnv '{key_env}' is not a valid environment variable name; skipping tailnet join"
+                );
+                false
+            } else {
+                require_auth_key(env::var(&key_env).ok(), &key_env).is_ok()
+            }
+        }
+        JoinMode::Skip => false,
     };
     // Only validate the tag when it will actually be used to join: an explicitly
     // passed --tag is still validated for fast feedback, but a malformed tag left
@@ -122,9 +156,12 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
         idle_timeout: idle,
         volume: volume.as_deref(),
     });
-    if joins_tailnet {
+    if let Some(value) = minted_key.as_deref() {
+        builder = with_secret_value(builder, &key_env, value, CONTROL_PLANE_HOST);
+    } else if joins_tailnet {
         builder = with_secret_env(builder, &key_env, CONTROL_PLANE_HOST);
     }
+    drop(minted_key);
     let sandbox = builder
         .create_detached()
         .await
@@ -186,5 +223,27 @@ mod tests {
         // construction. The meaningful guarantee is the env-reference below.
         assert!(serialized.contains("TS_AUTHKEY"));
         assert!(serialized.contains("\"kind\":\"env\""));
+    }
+
+    #[tokio::test]
+    async fn minted_tailscale_key_is_scoped_to_the_control_plane_host() {
+        let config = with_secret_value(
+            Sandbox::builder("tailscale-minted-secret-test").image("python"),
+            "TS_AUTHKEY",
+            "tskey-auth-minted",
+            CONTROL_PLANE_HOST,
+        )
+        .build()
+        .await
+        .unwrap();
+        let serialized = serde_json::to_string(&config).unwrap();
+
+        // A runtime-minted key isn't a host env var, so it must be carried via
+        // `.value()` rather than `.source()`. This legitimately puts the value
+        // in the serialized spec (the accepted tradeoff for this path) -- the
+        // guarantee we check here is that the host allowlist is still scoped
+        // to the control plane and never widened to "any host".
+        assert!(serialized.contains(CONTROL_PLANE_HOST));
+        assert!(!serialized.contains("\"any\""));
     }
 }

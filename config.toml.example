@@ -12,3 +12,12 @@ idle_timeout = "20m"
 # Caps — a `lilbox new` request above these is clamped down (with a warning).
 max_cpus = 4
 max_memory = "8G"
+
+# Tailnet join. OAuth (mint an ephemeral, tagged, 5-minute key per box) takes
+# precedence over authKeyEnv (a static, pre-generated key); neither set skips
+# the tailnet join. See README.md's "Tailnet ACLs" section for details.
+[tailscale]
+tag = "tag:lilbox-vm"
+oauthClientId = "k123abc..."
+oauthClientSecretEnv = "TS_OAUTH_CLIENT_SECRET"
+# authKeyEnv = "TS_AUTHKEY"
