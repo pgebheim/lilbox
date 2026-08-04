@@ -1,11 +1,12 @@
 use std::{env, fs, process::Command as ProcessCommand};
 
 use anyhow::{Result, anyhow, bail};
-use microsandbox::Image;
+use microsandbox::{Image, Sandbox, sandbox::SandboxStatus};
 
 use crate::app::App;
 use crate::model::{BoxRow, Template};
 use crate::sandbox::{connect_box, stop_and_remove};
+use crate::tailscale::tailscale_logout_args;
 use crate::util::{find_program, now, run_external};
 
 pub(crate) async fn provision(app: &App, name: &str, template: &Template) -> Result<()> {
@@ -67,8 +68,36 @@ pub(crate) async fn teardown(app: &App, row: &BoxRow) -> Result<()> {
         let verb = if row.public { "funnel" } else { "serve" };
         let _ = run_external(ts, &[verb, &format!("--https={port}"), "off"]);
     }
+    if row.tailscale_node.is_some() {
+        best_effort_tailnet_logout(&row.name).await;
+    }
     stop_and_remove(&row.name).await?;
     app.db
         .execute("DELETE FROM boxes WHERE name=?1", [&row.name])?;
     Ok(())
+}
+
+/// Best-effort: if the box is currently running, log its tailnet node out so
+/// an ephemeral node deregisters immediately instead of waiting to go
+/// offline. Never resumes a stopped box just to log it out, and any failure
+/// here (box not gettable, not running, exec error, non-zero exit) is only
+/// warned to stderr -- it must never block `stop_and_remove`/the DB delete.
+async fn best_effort_tailnet_logout(name: &str) {
+    let result: Result<()> = async {
+        let handle = Sandbox::get(name).await?;
+        match handle.status_snapshot() {
+            SandboxStatus::Running | SandboxStatus::Draining => {}
+            _ => return Ok(()),
+        }
+        let sandbox = handle.connect().await?;
+        let output = sandbox.exec("tailscale", tailscale_logout_args()).await?;
+        if !output.status().success {
+            bail!("tailscale logout exited non-zero");
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(err) = result {
+        eprintln!("warning: could not log out tailnet node for '{name}': {err}");
+    }
 }
