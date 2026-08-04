@@ -82,6 +82,23 @@ mod tests {
             Some("docker.io/library/golang:1.23-bookworm")
         );
         assert!(go.setup.unwrap().contains("gopls"));
+
+        // Every shipped starter resolves and carries an image (guards a typo'd
+        // include_str! path or a malformed template.json in any builtin).
+        for name in [
+            "python-dev",
+            "node-dev",
+            "rust-dev",
+            "go-dev",
+            "data-science",
+            "ml-pytorch",
+            "fullstack-web",
+            "base-debian",
+            "agent-sandbox",
+        ] {
+            let t = builtin_template(name).unwrap_or_else(|| panic!("missing builtin '{name}'"));
+            assert!(t.manifest.image.is_some(), "builtin '{name}' has no image");
+        }
     }
 
     #[test]
