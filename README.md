@@ -199,6 +199,15 @@ skip the tailnet join entirely. Any minting failure (bad credentials, network
 error, malformed response) only prints a warning and skips the join — it
 never fails `lilbox new`.
 
+**Security note:** joining the tailnet requires `tailscaled` in the guest to
+run `tailscale up --auth-key=...` itself — there's no way to join a node from
+the host on its behalf — so the box necessarily receives its own real auth
+key. It's delivered only as a transient environment variable on the one
+`tailscale up` exec, never through `lilbox`'s builder-level secret mechanism,
+so it's never written into the sandbox's persisted config at rest. Prefer
+**ephemeral, single-use** keys (the OAuth-minted path above already mints
+these) so the guest's momentary visibility of its own key is moot.
+
 ## Quickstart: a box on your tailnet
 
 Prereqs (once): the [Tailnet ACLs](#tailnet-acls) in place, a Tailscale

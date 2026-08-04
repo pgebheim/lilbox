@@ -7,11 +7,11 @@ use rusqlite::params;
 use crate::app::App;
 use crate::cli::NewArgs;
 use crate::provision::{build_template_image, provision};
-use crate::sandbox::{SandboxSettings, configure_builder, with_secret_env, with_secret_value};
+use crate::sandbox::{SandboxSettings, configure_builder};
 use crate::tailscale::{
-    CONTROL_PLANE_HOST, DEFAULT_AUTH_KEY_ENV, JoinMode, is_valid_env_var_name, join_failure_detail,
-    mint_ephemeral_key, node_hostname, require_auth_key, resolve_join_mode, resolve_tag,
-    tailscale_up_command, validate_tag,
+    DEFAULT_AUTH_KEY_ENV, JoinMode, is_valid_env_var_name, join_failure_detail, mint_ephemeral_key,
+    node_hostname, require_auth_key, resolve_join_mode, resolve_tag, tailscale_up_command,
+    validate_tag,
 };
 use crate::util::{
     DEFAULT_GUEST_PORT, DEFAULT_IMAGE, alloc_host_port, now, parse_duration, parse_memory,
@@ -146,7 +146,7 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
             ""
         }
     );
-    let mut builder = configure_builder(SandboxSettings {
+    let builder = configure_builder(SandboxSettings {
         name: &name,
         image: &image,
         host_port,
@@ -156,12 +156,6 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
         idle_timeout: idle,
         volume: volume.as_deref(),
     });
-    if let Some(value) = minted_key.as_deref() {
-        builder = with_secret_value(builder, &key_env, value, CONTROL_PLANE_HOST);
-    } else if joins_tailnet {
-        builder = with_secret_env(builder, &key_env, CONTROL_PLANE_HOST);
-    }
-    drop(minted_key);
     let sandbox = builder.create_detached().await.with_context(|| {
         format!(
             "could not create box '{name}' from image '{image}' \
@@ -175,28 +169,59 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
     )?;
     println!("box {name} is up ({image}, guest :{guest_port})");
     if joins_tailnet {
-        let argv = tailscale_up_command(&tag, &key_env, &name, guest_port);
-        match sandbox.exec(argv[0].clone(), argv[1..].to_vec()).await {
-            Ok(output) if output.status().success => {
-                if let Some(node) = output.stdout().ok().as_deref().and_then(node_hostname)
-                    && let Err(error) = app.db.execute(
-                        "UPDATE boxes SET tailscale_node=?1 WHERE name=?2",
-                        params![node, name],
-                    )
-                {
-                    eprintln!("warning: could not record tailscale node for '{name}': {error}");
+        // Tailscale requires the guest to present its own auth key to
+        // `tailscale up` -- there is no host-side "join for me" call, so the
+        // box necessarily sees the real key. Unlike the agent's Anthropic key
+        // (plain HTTPS, so the builder's placeholder-secret + `allow_host` TLS
+        // substitution works), `tailscaled` talks to controlplane.tailscale.com
+        // over the encrypted noise protocol, which the substitution can't
+        // intercept -- so the real value must reach the guest directly. We
+        // deliver it as a transient env var on this one exec (never through
+        // the builder, so it's never written into the sandbox's persisted
+        // config/state). Prefer ephemeral, single-use keys (the OAuth mint
+        // path above already does this) so the guest's momentary visibility
+        // of its own key is moot.
+        let auth_key = minted_key.take().or_else(|| env::var(&key_env).ok());
+        match auth_key {
+            Some(auth_key) => {
+                let argv = tailscale_up_command(&tag, &key_env, &name, guest_port);
+                let result = sandbox
+                    .exec_with(argv[0].clone(), |e| {
+                        e.args(argv[1..].to_vec())
+                            .env(key_env.as_str(), auth_key.as_str())
+                    })
+                    .await;
+                drop(auth_key);
+                match result {
+                    Ok(output) if output.status().success => {
+                        if let Some(node) = output.stdout().ok().as_deref().and_then(node_hostname)
+                            && let Err(error) = app.db.execute(
+                                "UPDATE boxes SET tailscale_node=?1 WHERE name=?2",
+                                params![node, name],
+                            )
+                        {
+                            eprintln!(
+                                "warning: could not record tailscale node for '{name}': {error}"
+                            );
+                        }
+                    }
+                    Ok(output) => eprintln!(
+                        "warning: could not join tailnet for '{name}': {}",
+                        join_failure_detail(
+                            output.status().code,
+                            &output.stderr().unwrap_or_default(),
+                            &image,
+                        )
+                    ),
+                    Err(error) => {
+                        eprintln!("warning: could not join tailnet for '{name}': {error}")
+                    }
                 }
             }
-            Ok(output) => eprintln!(
-                "warning: could not join tailnet for '{name}': {}",
-                join_failure_detail(
-                    output.status().code,
-                    &output.stderr().unwrap_or_default(),
-                    &image,
-                )
-            ),
-            Err(error) => {
-                eprintln!("warning: could not join tailnet for '{name}': {error}")
+            None => {
+                eprintln!(
+                    "warning: could not resolve tailnet auth key for '{name}'; skipping tailnet join"
+                );
             }
         }
     }
@@ -205,52 +230,4 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
     }
     println!("  lilbox exec {name} -- <cmd>\n  lilbox ssh {name}\n  lilbox expose {name}");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use microsandbox::Sandbox;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn tailscale_auth_key_is_stored_as_an_environment_reference() {
-        let config = with_secret_env(
-            Sandbox::builder("tailscale-secret-test").image("python"),
-            "TS_AUTHKEY",
-            CONTROL_PLANE_HOST,
-        )
-        .build()
-        .await
-        .unwrap();
-        let serialized = serde_json::to_string(&config).unwrap();
-
-        // The actual key value is resolved by the microsandbox runtime at sandbox
-        // start (via env lookup), so it never reaches the serialized config by
-        // construction. The meaningful guarantee is the env-reference below.
-        assert!(serialized.contains("TS_AUTHKEY"));
-        assert!(serialized.contains("\"kind\":\"env\""));
-    }
-
-    #[tokio::test]
-    async fn minted_tailscale_key_is_scoped_to_the_control_plane_host() {
-        let config = with_secret_value(
-            Sandbox::builder("tailscale-minted-secret-test").image("python"),
-            "TS_AUTHKEY",
-            "tskey-auth-minted",
-            CONTROL_PLANE_HOST,
-        )
-        .build()
-        .await
-        .unwrap();
-        let serialized = serde_json::to_string(&config).unwrap();
-
-        // A runtime-minted key isn't a host env var, so it must be carried via
-        // `.value()` rather than `.source()`. This legitimately puts the value
-        // in the serialized spec (the accepted tradeoff for this path) -- the
-        // guarantee we check here is that the host allowlist is still scoped
-        // to the control plane and never widened to "any host".
-        assert!(serialized.contains(CONTROL_PLANE_HOST));
-        assert!(!serialized.contains("\"any\""));
-    }
 }

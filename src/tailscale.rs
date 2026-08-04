@@ -11,7 +11,6 @@ const SERVE_PORT_MAX: u16 = 8480;
 
 const DEFAULT_TAG: &str = "tag:lilbox-vm";
 pub(crate) const DEFAULT_AUTH_KEY_ENV: &str = "TS_AUTHKEY";
-pub(crate) const CONTROL_PLANE_HOST: &str = "controlplane.tailscale.com";
 
 pub(crate) const DEFAULT_OAUTH_SECRET_ENV: &str = "TS_OAUTH_CLIENT_SECRET";
 const TAILSCALE_API_BASE: &str = "https://api.tailscale.com/api/v2";

@@ -267,19 +267,6 @@ pub(crate) fn with_secret_env(builder: SandboxBuilder, env: &str, host: &str) ->
     })
 }
 
-/// Injects a runtime-minted secret value (e.g. a freshly-minted Tailscale
-/// auth key) that isn't itself a host environment variable, so it must be
-/// carried via `.value()` rather than `.source()`. The value is dropped by
-/// the caller as soon as this builder is built.
-pub(crate) fn with_secret_value(
-    builder: SandboxBuilder,
-    env: &str,
-    value: &str,
-    host: &str,
-) -> SandboxBuilder {
-    builder.secret(|secret| secret_shape(secret, env, host).value(value))
-}
-
 pub(crate) async fn stop_and_remove(name: &str) -> Result<()> {
     if let Ok(handle) = Sandbox::get(name).await {
         let _ = handle.stop().await;
