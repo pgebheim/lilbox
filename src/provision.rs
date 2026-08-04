@@ -14,13 +14,13 @@ pub(crate) async fn provision(app: &App, name: &str, template: &Template) -> Res
         return Ok(());
     };
     let sandbox = connect_box(app, name, true).await?;
-    fs::create_dir_all(app.state_dir.join("logs"))?;
+    fs::create_dir_all(app.logs_dir())?;
     sandbox.fs().write("/tmp/lilbox-setup.sh", setup).await?;
     println!("provisioning {name} (template {}) ...", template.name);
     let output = sandbox.exec("/bin/sh", ["/tmp/lilbox-setup.sh"]).await?;
     let mut combined = output.stdout_bytes().to_vec();
     combined.extend_from_slice(output.stderr_bytes());
-    let log = app.state_dir.join("logs").join(format!("{name}-setup.log"));
+    let log = app.logs_dir().join(format!("{name}-setup.log"));
     fs::write(&log, combined)?;
     if !output.status().success {
         bail!("setup failed for '{name}' (full log: {})", log.display());

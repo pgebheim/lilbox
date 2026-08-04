@@ -1,4 +1,4 @@
-# lilbox config — copy to ~/.lilbox/config.toml
+# lilbox config — copy to ~/.config/lilbox/config.toml
 # Flat key = value configuration.
 
 # Defaults applied to `lilbox new` when the matching flag is omitted.

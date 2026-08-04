@@ -27,7 +27,7 @@ pub(crate) async fn cmd_agent(app: &App, args: AgentArgs) -> Result<i32> {
             .next()
             .unwrap_or("repo")
             .trim_end_matches(".git");
-        let dest = app.state_dir.join("workspaces").join(repo);
+        let dest = app.workspaces_dir().join(repo);
         if dest.exists() {
             bail!("clone target already exists: {}", dest.display());
         }

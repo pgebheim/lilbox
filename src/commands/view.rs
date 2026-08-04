@@ -70,7 +70,7 @@ pub(crate) fn templates(app: &App) -> Result<()> {
         builtin_template("node-dev").unwrap(),
         builtin_template("python-dev").unwrap(),
     ];
-    let user = app.state_dir.join("templates");
+    let user = app.templates_dir();
     if let Ok(entries) = fs::read_dir(user) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -167,7 +167,7 @@ pub(crate) fn doctor(app: &App) -> Result<()> {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "not found".into()),
-        app.state_dir.join("state.db").display(),
+        app.db_path().display(),
         app.tailscale
             .as_deref()
             .and_then(tailnet_host)

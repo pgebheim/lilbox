@@ -1,4 +1,5 @@
-use std::{fs, path::PathBuf};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OptionalExtension};
@@ -9,6 +10,8 @@ use crate::templates::{builtin_template, validate_template_name};
 use crate::util::find_program;
 
 pub(crate) struct App {
+    pub(crate) config_dir: PathBuf,
+    pub(crate) data_dir: PathBuf,
     pub(crate) state_dir: PathBuf,
     pub(crate) db: Connection,
     pub(crate) tailscale: Option<PathBuf>,
@@ -42,19 +45,109 @@ fn migrate(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn resolve_dir(xdg_dir: Option<PathBuf>, kind: &str) -> Result<PathBuf> {
+    match xdg_dir {
+        Some(dir) => Ok(dir.join("lilbox")),
+        None => dirs::home_dir()
+            .map(|home| home.join(".lilbox"))
+            .ok_or_else(|| anyhow!("could not determine {kind} directory or home directory")),
+    }
+}
+
+/// Best-effort move of a legacy `~/.lilbox` file/directory to its new XDG
+/// home. Never errors -- a failure is only warned to stderr, since a
+/// migration hiccup must never block `App::new()`.
+fn move_best_effort(src: &Path, dest: &Path) {
+    if !src.exists() || src == dest {
+        return;
+    }
+    // Never clobber something already at the destination (e.g. a hand-created
+    // ~/.config/lilbox/config.toml): leave the legacy copy in place and warn.
+    if dest.exists() {
+        eprintln!(
+            "warning: not migrating {} — {} already exists",
+            src.display(),
+            dest.display()
+        );
+        return;
+    }
+    if let Some(parent) = dest.parent()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "warning: could not prepare {} for migration: {err:#}",
+            parent.display()
+        );
+        return;
+    }
+    if let Err(err) = fs::rename(src, dest) {
+        eprintln!(
+            "warning: could not migrate {} to {}: {err:#}",
+            src.display(),
+            dest.display()
+        );
+    }
+}
+
+/// One-time migration from the legacy single `~/.lilbox` dotdir to the XDG
+/// layout. Only runs when the legacy dir exists and the new state db hasn't
+/// been created yet, so it never clobbers a box that's already migrated.
+/// Best-effort throughout: any failure is warned, never fatal.
+fn migrate_legacy_dir(legacy: &Path, config_dir: &Path, data_dir: &Path, state_dir: &Path) {
+    if !legacy.exists() || state_dir.join("state.db").exists() {
+        return;
+    }
+    println!(
+        "migrating {} to the XDG state/config/data dirs ...",
+        legacy.display()
+    );
+    move_best_effort(&legacy.join("config.toml"), &config_dir.join("config.toml"));
+    move_best_effort(&legacy.join("state.db"), &state_dir.join("state.db"));
+    move_best_effort(&legacy.join("logs"), &state_dir.join("logs"));
+    move_best_effort(&legacy.join("templates"), &data_dir.join("templates"));
+    move_best_effort(&legacy.join("workspaces"), &data_dir.join("workspaces"));
+}
+
 impl App {
     pub(crate) fn new() -> Result<Self> {
-        let state_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow!("could not determine home directory"))?
-            .join(".lilbox");
+        let config_dir = resolve_dir(dirs::config_dir(), "config")?;
+        let data_dir = resolve_dir(dirs::data_dir(), "data")?;
+        let state_dir = resolve_dir(dirs::state_dir(), "state")?;
+        fs::create_dir_all(&config_dir)?;
+        fs::create_dir_all(&data_dir)?;
         fs::create_dir_all(&state_dir)?;
+        if let Some(legacy) = dirs::home_dir().map(|home| home.join(".lilbox")) {
+            migrate_legacy_dir(&legacy, &config_dir, &data_dir, &state_dir);
+        }
         let db = Connection::open(state_dir.join("state.db"))?;
         migrate(&db)?;
         Ok(Self {
+            config_dir,
+            data_dir,
             state_dir,
             db,
             tailscale: find_program("tailscale"),
         })
+    }
+
+    pub(crate) fn config_path(&self) -> PathBuf {
+        self.config_dir.join("config.toml")
+    }
+
+    pub(crate) fn db_path(&self) -> PathBuf {
+        self.state_dir.join("state.db")
+    }
+
+    pub(crate) fn logs_dir(&self) -> PathBuf {
+        self.state_dir.join("logs")
+    }
+
+    pub(crate) fn workspaces_dir(&self) -> PathBuf {
+        self.data_dir.join("workspaces")
+    }
+
+    pub(crate) fn templates_dir(&self) -> PathBuf {
+        self.data_dir.join("templates")
     }
 
     pub(crate) fn row(&self, name: &str) -> Result<Option<BoxRow>> {
@@ -101,7 +194,7 @@ impl App {
     }
 
     pub(crate) fn config(&self) -> Result<Config> {
-        let path = self.state_dir.join("config.toml");
+        let path = self.config_path();
         if !path.exists() {
             return Ok(Config::default());
         }
@@ -111,7 +204,7 @@ impl App {
 
     pub(crate) fn template(&self, name: &str) -> Result<Template> {
         validate_template_name(name)?;
-        let user = self.state_dir.join("templates").join(name);
+        let user = self.templates_dir().join(name);
         if user.join("template.json").is_file() {
             let manifest = serde_json::from_str(&fs::read_to_string(user.join("template.json"))?)?;
             let setup = user.join("setup.sh");
@@ -142,6 +235,8 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         migrate(&db).unwrap();
         App {
+            config_dir: PathBuf::new(),
+            data_dir: PathBuf::new(),
             state_dir: PathBuf::new(),
             db,
             tailscale: None,
@@ -178,6 +273,78 @@ mod tests {
             .unwrap();
         let row = app.row("box2").unwrap().unwrap();
         assert!(row.tailscale_node.is_none());
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "lilbox-app-test-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn resolve_dir_uses_xdg_dir_when_present() {
+        let resolved = resolve_dir(Some(PathBuf::from("/xdg/config")), "config").unwrap();
+        assert_eq!(resolved, PathBuf::from("/xdg/config/lilbox"));
+    }
+
+    #[test]
+    fn migrate_legacy_dir_moves_pieces_to_new_homes() {
+        let root = temp_dir("migrate");
+        let legacy = root.join("legacy");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let state_dir = root.join("state");
+        fs::create_dir_all(legacy.join("logs")).unwrap();
+        fs::create_dir_all(legacy.join("templates").join("my-template")).unwrap();
+        fs::create_dir_all(legacy.join("workspaces")).unwrap();
+        fs::write(legacy.join("config.toml"), "image = \"alpine\"").unwrap();
+        fs::write(legacy.join("state.db"), b"fake-db").unwrap();
+        fs::write(legacy.join("logs").join("box-setup.log"), "log").unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+
+        migrate_legacy_dir(&legacy, &config_dir, &data_dir, &state_dir);
+
+        assert!(config_dir.join("config.toml").is_file());
+        assert!(state_dir.join("state.db").is_file());
+        assert!(state_dir.join("logs").join("box-setup.log").is_file());
+        assert!(data_dir.join("templates").join("my-template").is_dir());
+        assert!(data_dir.join("workspaces").is_dir());
+        assert!(!legacy.join("config.toml").exists());
+        assert!(!legacy.join("state.db").exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn migrate_legacy_dir_skips_when_state_db_already_exists() {
+        let root = temp_dir("migrate-skip");
+        let legacy = root.join("legacy");
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("state.db"), b"legacy-db").unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(state_dir.join("state.db"), b"already-migrated").unwrap();
+
+        migrate_legacy_dir(&legacy, &config_dir, &data_dir, &state_dir);
+
+        assert!(legacy.join("state.db").is_file());
+        assert_eq!(
+            fs::read(state_dir.join("state.db")).unwrap(),
+            b"already-migrated"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
