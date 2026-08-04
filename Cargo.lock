@@ -2490,7 +2490,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lilexe"
+name = "lilbox"
 version = "0.1.0"
 dependencies = [
  "anyhow",

@@ -41,7 +41,7 @@ pub(crate) async fn ls(app: &App, json: bool) -> Result<()> {
             .collect();
         println!("{}", serde_json::to_string(&values)?);
     } else if rows.is_empty() {
-        println!("no boxes yet - create one with: vm new");
+        println!("no boxes yet - create one with: lilbox new");
     } else {
         println!("{:<20}  {:<20}  {:<10}  URL", "NAME", "IMAGE", "STATUS");
         for row in rows {
@@ -104,7 +104,7 @@ pub(crate) async fn volumes(app: &App) -> Result<()> {
     println!("{:<28}  {:<20}  USED", "VOLUME", "BOX");
     for volume in volumes
         .into_iter()
-        .filter(|v| v.name().starts_with("lilexe-") || owner.contains_key(v.name()))
+        .filter(|v| v.name().starts_with("lilbox-") || owner.contains_key(v.name()))
     {
         println!(
             "{:<28}  {:<20}  {}",
@@ -158,7 +158,7 @@ pub(crate) async fn stat(app: &App, name: String) -> Result<()> {
 
 pub(crate) fn doctor(app: &App) -> Result<()> {
     println!(
-        "lilexe doctor\n  runtime:    embedded microsandbox 0.6.8\n  tailscale:  {}\n  state db:   {}\n  tailnet:    {}\n",
+        "lilbox doctor\n  runtime:    embedded microsandbox 0.6.8\n  tailscale:  {}\n  state db:   {}\n  tailnet:    {}\n",
         app.tailscale
             .as_ref()
             .map(|p| p.display().to_string())

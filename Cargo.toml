@@ -1,12 +1,12 @@
 [package]
-name = "lilexe"
+name = "lilbox"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "A lil exe.dev you run on your own box"
 
 [[bin]]
-name = "vm"
+name = "lilbox"
 path = "src/main.rs"
 
 [dependencies]

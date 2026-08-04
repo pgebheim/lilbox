@@ -67,8 +67,8 @@ pub(crate) async fn cmd_agent(app: &App, args: AgentArgs) -> Result<i32> {
         .workdir(AGENT_WORKDIR)
         .volume(AGENT_WORKDIR, |m| m.bind(&workspace))
         .detached(true)
-        .label("dev.lilexe.managed", "true")
-        .label("dev.lilexe.kind", "agent");
+        .label("dev.lilbox.managed", "true")
+        .label("dev.lilbox.kind", "agent");
     if env::var(&args.key_env).is_ok_and(|value| !value.is_empty()) {
         builder = with_agent_secret(builder, &args.key_env, &args.key_host);
     } else {

@@ -74,7 +74,7 @@ pub(crate) fn url(app: &App, name: String) -> Result<()> {
         "{}",
         app.require_row(&name)?
             .url
-            .ok_or_else(|| anyhow!("'{name}' is not exposed (vm expose {name})"))?
+            .ok_or_else(|| anyhow!("'{name}' is not exposed (lilbox expose {name})"))?
     );
     Ok(())
 }

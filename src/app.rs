@@ -18,7 +18,7 @@ impl App {
     pub(crate) fn new() -> Result<Self> {
         let state_dir = dirs::home_dir()
             .ok_or_else(|| anyhow!("could not determine home directory"))?
-            .join(".lilexe");
+            .join(".lilbox");
         fs::create_dir_all(&state_dir)?;
         let db = Connection::open(state_dir.join("state.db"))?;
         db.execute_batch(
@@ -66,7 +66,7 @@ impl App {
 
     pub(crate) fn require_row(&self, name: &str) -> Result<BoxRow> {
         self.row(name)?
-            .ok_or_else(|| anyhow!("no box named '{name}' (see: vm ls)"))
+            .ok_or_else(|| anyhow!("no box named '{name}' (see: lilbox ls)"))
     }
 
     pub(crate) fn rows(&self) -> Result<Vec<BoxRow>> {
@@ -121,6 +121,6 @@ impl App {
             });
         }
         builtin_template(name)
-            .ok_or_else(|| anyhow!("no template named '{name}' (see: vm templates)"))
+            .ok_or_else(|| anyhow!("no template named '{name}' (see: lilbox templates)"))
     }
 }

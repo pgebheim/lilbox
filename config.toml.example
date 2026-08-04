@@ -1,7 +1,7 @@
-# lilexe config — copy to ~/.lilexe/config.toml
+# lilbox config — copy to ~/.lilbox/config.toml
 # Flat key = value configuration.
 
-# Defaults applied to `vm new` when the matching flag is omitted.
+# Defaults applied to `lilbox new` when the matching flag is omitted.
 image = "python"
 port = 8000
 cpus = 2
@@ -9,6 +9,6 @@ memory = "2G"
 ttl = "8h"
 idle_timeout = "20m"
 
-# Caps — a `vm new` request above these is clamped down (with a warning).
+# Caps — a `lilbox new` request above these is clamped down (with a warning).
 max_cpus = 4
 max_memory = "8G"

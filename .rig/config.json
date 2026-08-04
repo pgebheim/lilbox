@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/agent-rig/rig/main/rig.schema.json",
   "project": {
-    "name": "lilexe",
+    "name": "lilbox",
     "repo": "pgebheim/lilexe"
   },
   "runtime": {
