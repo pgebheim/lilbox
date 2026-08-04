@@ -5,7 +5,7 @@ ships `tailscale` + `tailscaled` and a first-boot bring-up hook, so it can join
 your tailnet as its *own* node instead of being published from the host.
 
 This directory builds that image. Joining the tailnet as a tagged, ephemeral
-node (`tailscale up --auth-key=… --advertise-tags=tag:lilbox-box --ssh`) is
+node (`tailscale up --auth-key=… --advertise-tags=tag:lilbox-vm --ssh`) is
 layered on by `lilbox new` in a later step (#4); this image bakes in only the
 binaries and the daemon bring-up.
 
@@ -41,4 +41,4 @@ lilbox exec mybox -- tailscale version  # -> 1.66.4  (tailscale is baked in)
 
 The `lilbox-boot` hook starts `tailscaled` (bringing up a `tailscale0` kernel
 tun); a later step runs `tailscale up` with an injected ephemeral, tagged auth
-key so the box appears in `tailscale status` as its own `tag:lilbox-box` node.
+key so the box appears in `tailscale status` as its own `tag:lilbox-vm` node.
