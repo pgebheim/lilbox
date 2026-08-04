@@ -6,7 +6,7 @@ use microsandbox::{Image, Sandbox, Volume};
 use crate::app::App;
 use crate::cli::ImageCommand;
 use crate::sandbox::{status_name, statuses};
-use crate::tailscale::tailnet_host;
+use crate::tailscale::{box_display_url, tailnet_host};
 use crate::templates::builtin_template;
 use crate::util::human_bytes;
 
@@ -26,6 +26,8 @@ pub(crate) async fn ls(app: &App, json: bool) -> Result<()> {
                     .copied()
                     .map(status_name)
                     .unwrap_or_else(|| "gone".into());
+                let tailnet_url =
+                    box_display_url(row.tailscale_node.as_deref(), row.url.as_deref());
                 serde_json::json!({
                     "name": row.name,
                     "image": row.image,
@@ -35,6 +37,7 @@ pub(crate) async fn ls(app: &App, json: bool) -> Result<()> {
                     "serve_port": row.serve_port,
                     "public": row.public,
                     "url": row.url,
+                    "tailnet_url": tailnet_url,
                     "created": row.created,
                 })
             })
@@ -50,12 +53,13 @@ pub(crate) async fn ls(app: &App, json: bool) -> Result<()> {
                 .copied()
                 .map(status_name)
                 .unwrap_or_else(|| "gone".into());
+            let display_url = box_display_url(row.tailscale_node.as_deref(), row.url.as_deref());
             println!(
                 "{:<20}  {:<20}  {:<10}  {}",
                 row.name,
                 row.image,
                 status,
-                row.url.as_deref().unwrap_or("-")
+                display_url.as_deref().unwrap_or("-")
             );
         }
     }
