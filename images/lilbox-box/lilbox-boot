@@ -8,7 +8,8 @@
 #
 # This hook only starts the DAEMON. Joining the tailnet as a tagged ephemeral
 # node -- `tailscale up --auth-key=... --advertise-tags=tag:lilbox-vm --ssh` --
-# is done by `lilbox new` (issue #4), which injects the auth key through the SDK.
+# is done by `lilbox new`, which injects the auth key through the SDK and runs
+# `tailscale up` inside the box once this hook brings tailscaled up.
 # Kept idempotent so it is safe to invoke more than once.
 set -eu
 

@@ -126,6 +126,9 @@ pub(crate) struct NewArgs {
     pub(crate) ttl: Option<String>,
     #[arg(long)]
     pub(crate) idle_timeout: Option<String>,
+    /// Tailnet ACL tag to advertise when joining (default: tag:lilbox-vm).
+    #[arg(long)]
+    pub(crate) tag: Option<String>,
 }
 
 #[derive(Args)]
