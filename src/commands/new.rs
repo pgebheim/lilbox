@@ -75,7 +75,7 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
     let volume = if args.no_persist {
         None
     } else {
-        Some(args.volume.unwrap_or_else(|| format!("lilexe-{name}-home")))
+        Some(args.volume.unwrap_or_else(|| format!("lilbox-{name}-home")))
     };
     let host_port = alloc_host_port()?;
     println!(
@@ -107,6 +107,6 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
     if let Some(template) = &template {
         provision(app, &name, template).await?;
     }
-    println!("  vm exec {name} -- <cmd>\n  vm ssh {name}\n  vm expose {name}");
+    println!("  lilbox exec {name} -- <cmd>\n  lilbox ssh {name}\n  lilbox expose {name}");
     Ok(())
 }

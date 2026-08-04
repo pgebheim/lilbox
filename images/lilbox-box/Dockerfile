@@ -1,11 +1,11 @@
-# lilexe-box — a base box image with Tailscale baked in.
+# lilbox-box — a base box image with Tailscale baked in.
 #
 # Built with Docker, imported into microsandbox (see build.sh). Booting this
 # image as a microVM gives a box that already has `tailscale` + `tailscaled`
 # and a first-boot bring-up hook, so it can join your tailnet as its own node.
 #
 # Auth (joining the tailnet as a tagged ephemeral node) is layered on top by
-# `vm new` — it injects an ephemeral, tag:lilexe-box auth key and runs
+# `lilbox new` — it injects an ephemeral, tag:lilbox-box auth key and runs
 # `tailscale up`. This image only bakes in the binaries + the bring-up hook.
 FROM alpine:3.20
 
@@ -22,8 +22,8 @@ RUN apk add --no-cache \
 RUN mkdir -p /var/lib/tailscale /var/run/tailscale
 
 # First-boot bring-up hook (starts tailscaled on a kernel tun).
-COPY lilexe-boot /usr/local/bin/lilexe-boot
-RUN chmod +x /usr/local/bin/lilexe-boot
+COPY lilbox-boot /usr/local/bin/lilbox-boot
+RUN chmod +x /usr/local/bin/lilbox-boot
 
-LABEL dev.lilexe.image="lilexe-box" \
-      dev.lilexe.tailscale="baked"
+LABEL dev.lilbox.image="lilbox-box" \
+      dev.lilbox.tailscale="baked"

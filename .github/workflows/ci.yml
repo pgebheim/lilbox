@@ -28,4 +28,4 @@ jobs:
         run: cargo test --locked
 
 # The live end-to-end smoke test needs a KVM host, so it remains a manual or
-# self-hosted-runner check (`vm doctor` must pass).
+# self-hosted-runner check (`lilbox doctor` must pass).

@@ -14,9 +14,9 @@ pub(crate) async fn provision(app: &App, name: &str, template: &Template) -> Res
     };
     let sandbox = connect_box(app, name, true).await?;
     fs::create_dir_all(app.state_dir.join("logs"))?;
-    sandbox.fs().write("/tmp/lilexe-setup.sh", setup).await?;
+    sandbox.fs().write("/tmp/lilbox-setup.sh", setup).await?;
     println!("provisioning {name} (template {}) ...", template.name);
-    let output = sandbox.exec("/bin/sh", ["/tmp/lilexe-setup.sh"]).await?;
+    let output = sandbox.exec("/bin/sh", ["/tmp/lilbox-setup.sh"]).await?;
     let mut combined = output.stdout_bytes().to_vec();
     combined.extend_from_slice(output.stderr_bytes());
     let log = app.state_dir.join("logs").join(format!("{name}-setup.log"));
@@ -29,7 +29,7 @@ pub(crate) async fn provision(app: &App, name: &str, template: &Template) -> Res
 }
 
 pub(crate) async fn build_template_image(template: &Template, rebuild: bool) -> Result<String> {
-    let tag = format!("lilexe/{}:latest", template.name);
+    let tag = format!("lilbox/{}:latest", template.name);
     if !rebuild && Image::get(&tag).await.is_ok() {
         return Ok(tag);
     }
@@ -47,7 +47,7 @@ pub(crate) async fn build_template_image(template: &Template, rebuild: bool) -> 
         bail!("docker build failed for template '{}'", template.name);
     }
     let archive =
-        env::temp_dir().join(format!("lilexe-image-{}-{}.tar", std::process::id(), now()));
+        env::temp_dir().join(format!("lilbox-image-{}-{}.tar", std::process::id(), now()));
     let status = ProcessCommand::new(&docker)
         .args(["save", "-o"])
         .arg(&archive)

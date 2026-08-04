@@ -6,7 +6,7 @@ use crate::util::DEFAULT_IMAGE;
 
 #[derive(Parser)]
 #[command(
-    name = "vm",
+    name = "lilbox",
     about = "a lil exe.dev you run yourself - microVMs on your tailnet"
 )]
 pub(crate) struct Cli {

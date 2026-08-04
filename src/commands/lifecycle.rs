@@ -113,7 +113,7 @@ pub(crate) async fn fork(app: &App, name: String, newname: Option<String>) -> Re
         SandboxStatus::Running | SandboxStatus::Draining
     );
     handle.stop().await?;
-    let snapshot = format!("lilexe-{name}-{}", now());
+    let snapshot = format!("lilbox-{name}-{}", now());
     let snapshot_result = handle.snapshot(&snapshot).await;
     if was_running {
         let restart_result = Sandbox::start_detached(&name).await;

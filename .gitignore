@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
-.lilexe/
+.lilbox/
 state.db
 .rig/epics/
 target/

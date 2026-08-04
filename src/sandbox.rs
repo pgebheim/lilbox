@@ -56,7 +56,7 @@ pub(crate) async fn connect_box(app: &App, name: &str, auto_resume: bool) -> Res
                 .execute("UPDATE boxes SET stopped_reason=NULL WHERE name=?1", [name])?;
             Ok(sandbox)
         }
-        _ => bail!("box '{name}' is stopped - start it with: vm start {name}"),
+        _ => bail!("box '{name}' is stopped - start it with: lilbox start {name}"),
     }
 }
 
@@ -174,7 +174,7 @@ pub(crate) async fn run_guest(
 
 pub(crate) async fn exec(app: &App, args: ExecArgs) -> Result<i32> {
     if args.cmd.is_empty() {
-        bail!("nothing to run - usage: vm exec NAME -- <cmd>");
+        bail!("nothing to run - usage: lilbox exec NAME -- <cmd>");
     }
     run_guest(&connect_box(app, &args.name, true).await?, &args.cmd, None).await
 }
@@ -223,7 +223,7 @@ pub(crate) fn configure_builder(
         .image(settings.image)
         .port(settings.host_port, settings.guest_port)
         .detached(true)
-        .label("dev.lilexe.managed", "true");
+        .label("dev.lilbox.managed", "true");
     if let Some(cpus) = settings.cpus {
         builder = builder.cpus(cpus);
     }
