@@ -5,7 +5,7 @@
 # and a first-boot bring-up hook, so it can join your tailnet as its own node.
 #
 # Auth (joining the tailnet as a tagged ephemeral node) is layered on top by
-# `lilbox new` — it injects an ephemeral, tag:lilbox-box auth key and runs
+# `lilbox new` — it injects an ephemeral, tag:lilbox-vm auth key and runs
 # `tailscale up`. This image only bakes in the binaries + the bring-up hook.
 FROM alpine:3.20
 
