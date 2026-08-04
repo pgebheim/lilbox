@@ -8,7 +8,7 @@ use crate::util::successful_output;
 const SERVE_PORT_BASE: u16 = 8443;
 const SERVE_PORT_MAX: u16 = 8480;
 
-pub(crate) const DEFAULT_TAG: &str = "tag:lilbox-vm";
+const DEFAULT_TAG: &str = "tag:lilbox-vm";
 pub(crate) const DEFAULT_AUTH_KEY_ENV: &str = "TS_AUTHKEY";
 pub(crate) const CONTROL_PLANE_HOST: &str = "controlplane.tailscale.com";
 
@@ -99,7 +99,7 @@ pub(crate) fn serve_ports(ts: &Path) -> HashSet<u16> {
 }
 
 /// The box's own MagicDNS URL, e.g. `https://web.tail1234.ts.net/`.
-pub(crate) fn magicdns_url(node: &str) -> String {
+fn magicdns_url(node: &str) -> String {
     format!("https://{node}/")
 }
 
