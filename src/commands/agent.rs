@@ -2,26 +2,15 @@ use std::{env, fs, process::Command as ProcessCommand};
 
 use anyhow::{Result, anyhow, bail};
 use chrono::Local;
-use microsandbox::{Sandbox, SecretSource, sandbox::SandboxBuilder};
+use microsandbox::Sandbox;
 use rusqlite::params;
 
 use crate::app::App;
 use crate::cli::AgentArgs;
-use crate::sandbox::run_guest;
+use crate::sandbox::{run_guest, with_secret_env};
 use crate::util::{DEFAULT_GUEST_PORT, alloc_host_port, find_program, random_name};
 
 const AGENT_WORKDIR: &str = "/workspace";
-
-fn with_agent_secret(builder: SandboxBuilder, key_env: &str, key_host: &str) -> SandboxBuilder {
-    builder.secret(|secret| {
-        secret
-            .env(key_env)
-            .source(SecretSource::Env {
-                var: key_env.to_owned(),
-            })
-            .allow_host(key_host)
-    })
-}
 
 pub(crate) async fn cmd_agent(app: &App, args: AgentArgs) -> Result<i32> {
     let name = match args.name {
@@ -70,7 +59,7 @@ pub(crate) async fn cmd_agent(app: &App, args: AgentArgs) -> Result<i32> {
         .label("dev.lilbox.managed", "true")
         .label("dev.lilbox.kind", "agent");
     if env::var(&args.key_env).is_ok_and(|value| !value.is_empty()) {
-        builder = with_agent_secret(builder, &args.key_env, &args.key_host);
+        builder = with_secret_env(builder, &args.key_env, &args.key_host);
     } else {
         eprintln!(
             "warning: {} is not set; the agent cannot authenticate",
@@ -120,7 +109,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_secret_is_stored_as_an_environment_reference() {
-        let config = with_agent_secret(
+        let config = with_secret_env(
             Sandbox::builder("agent-secret-test").image("python"),
             "ANTHROPIC_API_KEY",
             "api.anthropic.com",

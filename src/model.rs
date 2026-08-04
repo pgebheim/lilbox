@@ -16,6 +16,7 @@ pub(crate) struct BoxRow {
     pub(crate) expires: Option<i64>,
     pub(crate) stopped_reason: Option<String>,
     pub(crate) created: Option<String>,
+    pub(crate) tailscale_node: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

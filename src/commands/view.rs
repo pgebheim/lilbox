@@ -143,12 +143,13 @@ pub(crate) async fn image(command: ImageCommand) -> Result<()> {
 }
 
 pub(crate) async fn stat(app: &App, name: String) -> Result<()> {
-    app.require_row(&name)?;
+    let row = app.require_row(&name)?;
     let handle = Sandbox::get(&name).await?;
     println!(
-        "name: {}\nstatus: {}\nconfig: {}",
+        "name: {}\nstatus: {}\ntailscale node: {}\nconfig: {}",
         handle.name(),
         status_name(handle.status_snapshot()),
+        row.tailscale_node.as_deref().unwrap_or("-"),
         serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(
             handle.config_json()
         )?)?
