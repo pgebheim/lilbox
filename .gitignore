@@ -3,3 +3,7 @@ __pycache__/
 .lilexe/
 state.db
 .rig/epics/
+target/
+smithers.db
+smithers.db-shm
+smithers.db-wal

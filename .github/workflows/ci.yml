@@ -8,20 +8,24 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        # Prove the stdlib-only floor (3.8) and a current version.
-        python-version: ["3.8", "3.12"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Install system dependencies
+        # microsandbox's VMM (msb-krun -> caps/capng) links against libcap-ng,
+        # which isn't preinstalled on the GitHub runner.
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: ${{ matrix.python-version }}
-      - name: Compile
-        run: python3 -m py_compile bin/vm
-      - name: Unit tests
-        run: python3 -m unittest discover -s tests -v
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt -- --check
+      - name: Check
+        run: cargo check --locked
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
 
-# NOTE: the live end-to-end smoke test (`vm new` boots a real microVM) needs a
-# KVM host. GitHub-hosted runners have no nested virtualization, so it is NOT run
-# here — run it on a self-hosted KVM runner or manually (`vm doctor` must pass).
+# The live end-to-end smoke test needs a KVM host, so it remains a manual or
+# self-hosted-runner check (`vm doctor` must pass).

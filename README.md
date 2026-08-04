@@ -13,7 +13,8 @@ control by gluing together two pieces you can self-host:
 |---|---|---|
 | Isolation | proprietary VMs | [**microsandbox**](https://microsandbox.dev) — libkrun microVMs (real kernel per box, KVM-isolated) |
 | Publishing | HTTP proxies + custom domains | [**Tailscale**](https://tailscale.com) Serve (tailnet HTTPS) / Funnel (public) |
-| State | Go + SQLite ("GUTS") | one Python file + SQLite |
+| Runtime | service-managed VMs | native Rust + embedded `microsandbox` SDK |
+| State | Go + SQLite ("GUTS") | Rust + SQLite |
 
 Each box is a genuine microVM — it boots its own Linux kernel in ~1–2s, not a
 container sharing yours.
@@ -26,20 +27,22 @@ is the isolation you actually want when running code an LLM just wrote.
 
 ## Requirements
 
-- Linux host with KVM (`msb doctor` must pass — nested virt is fine)
-- [microsandbox](https://microsandbox.dev): `curl -fsSL https://install.microsandbox.dev | sh`
+- Linux host with KVM (`vm doctor` checks it; nested virtualization is fine)
+- Rust 1.85+ and Cargo (build-time only)
 - [Tailscale](https://tailscale.com) (only needed for `vm expose`)
-- Python 3.8+ (stdlib only — no pip installs)
+
+The Rust SDK downloads its matching runtime components on the first build/use.
+The separate `msb` executable is not required.
 
 ## Install
 
 ```bash
 git clone <this repo> && cd lilexe
-./install.sh            # symlinks bin/vm into ~/.local/bin
+./install.sh            # builds and installs vm into ~/.local/bin
 vm doctor               # verify the runtime
 ```
 
-Or just run `./bin/vm` in place.
+For development, use `cargo run -- <command>`.
 
 ## Quickstart
 
@@ -75,7 +78,7 @@ vm run -- python3 -c 'print("ran in a throwaway microVM")'
 | `vm exec NAME -- CMD…` | Run a command inside a box |
 | `vm ssh NAME [-- CMD]` | Interactive shell (or one-shot command) |
 | `vm cp SRC DST` | Copy files to/from a box (box side = `NAME:/path`) |
-| `vm logs NAME [-f] [--tail N] [--source S]` | Show a box's captured output |
+| `vm logs NAME [-f] [--tail N] [--source S]` | Show or follow captured output |
 | `vm run [--image I] -- CMD…` | Ephemeral box: boot, run, discard |
 | `vm rebuild NAME [--image X]` | Recreate a box on a new/updated image, keeping its home volume |
 | `vm agent [NAME] [--workspace D\|--clone URL] [--agents-file F] -- task` | Run a coding agent (Claude Code) in a box against a mounted workspace |
@@ -85,9 +88,11 @@ vm run -- python3 -c 'print("ran in a throwaway microVM")'
 | `vm stop/start/restart NAME` | Lifecycle |
 | `vm fork NAME [NEWNAME]` | Snapshot a box and boot a clone from it |
 | `vm volumes` | List persistent home volumes (and orphans) |
+| `vm image load ARCHIVE --tag TAG` | Import an OCI/Docker archive through the Rust SDK |
+| `vm image ls` | List the embedded runtime's image cache |
 | `vm rm NAME [--keep-data]` | Remove a box + unpublish; deletes its home volume unless `--keep-data` |
 | `vm stat NAME` | Detailed box info |
-| `vm doctor` | Check msb + tailscale + tailnet |
+| `vm doctor` | Check the embedded microsandbox runtime, KVM, Tailscale, and tailnet |
 
 ## Templates
 
@@ -96,7 +101,7 @@ post-boot setup script. It's a directory `<name>/`:
 
 ```
 <name>/
-  template.json      # image + defaults (cpus/memory/port) — JSON, stdlib-only
+  template.json      # image + defaults (cpus/memory/port)
   setup.sh           # optional: run inside the box after boot (idempotent)
   Dockerfile         # optional: build the image locally instead of pulling
 ```
@@ -111,7 +116,7 @@ Resolution: user templates in `~/.lilexe/templates/` **override** repo starters
 in `templates/`. Precedence for values is **CLI flag > template > default**
 (`vm new --image alpine --template python-dev` boots alpine, keeping the
 template's other defaults). If a template has a `Dockerfile` (and no `image`),
-`vm new` builds it (`docker build` → `msb load`) and caches it; `--rebuild`
+`vm new` builds it with Docker, imports it through `Image::load`, and caches it; `--rebuild`
 forces a fresh build. `setup.sh` runs post-boot; a non-zero exit is surfaced and
 logged to `~/.lilexe/logs/<box>-setup.log` (the box is kept for inspection).
 
@@ -120,8 +125,8 @@ Shipped starters: **`python-dev`** (python + git + uv) and **`node-dev`**
 
 ## How publishing works
 
-`vm new` maps a guest port to a random host loopback port
-(`msb create --port <host>:<guest>`). `vm expose` then points
+`vm new` maps a guest port to a random host loopback port using
+`SandboxBuilder::port`. `vm expose` then points
 `tailscale serve` at that host port on a dedicated HTTPS port (8443+), so every
 box gets its own URL and nothing collides with an existing root `serve`/Caddy
 setup. `--public` swaps `serve` for `funnel` (443/8443/10000 only) to reach the
@@ -137,7 +142,7 @@ can join your tailnet as its own node — the foundation for per-box hostnames,
 keyless `vm ssh`, and identity-based auth (epic #2).
 
 ```bash
-images/lilexe-box/build.sh          # docker build -> msb load as `lilexe-box`
+images/lilexe-box/build.sh          # docker build -> vm image load
 vm new mybox --image lilexe-box     # boot it
 vm exec mybox -- tailscale version  # tailscale is baked in
 ```
@@ -146,7 +151,7 @@ See [`images/lilexe-box/README.md`](images/lilexe-box/README.md) for details.
 
 ## Persistent volumes (devboxes)
 
-Every `vm new` box gets a named msb volume `lilexe-<name>-home` mounted at
+Every `vm new` box gets a named microsandbox volume `lilexe-<name>-home` mounted at
 `/root`, so its home **survives `vm stop`/`start` and image swaps** — a sandbox
 becomes a devbox. Pass `--no-persist` for a throwaway home (`vm run` is always
 ephemeral).
@@ -192,36 +197,27 @@ vm agent --agents-file ./AGENTS.md -- "..."     # pass repo agent instructions
 The workspace is bind-mounted at `/workspace`, so the agent's edits appear on
 the host **as it works** — retrieve them directly (or `vm expose` what it built).
 Bring your own key: `export ANTHROPIC_API_KEY=…` and it's injected via
-microsandbox secret injection (`--secret`) — sent only to `api.anthropic.com`
+the SDK's `secret_env` API — sent only to `api.anthropic.com`
 and **never written into the box's image or state**. Override with
 `--key-env`/`--key-host`.
 
 ## Configuration
 
-`~/.lilexe/config.toml` sets defaults for `vm new` (flat `key = value`, parsed
-with the stdlib — no `tomllib`/pip needed):
-
-```toml
-image = "python"
-port = 8000
-cpus = 2
-memory = "2G"
-```
-
-Precedence is **CLI flag > config > built-in default**. See
+`~/.lilexe/config.toml` sets `vm new` defaults using standard TOML. Precedence
+is **CLI flag > template > config > built-in default**. See
 [`config.toml.example`](config.toml.example).
 
 ## Testing
 
-Stdlib `unittest` (no pip); the msb/tailscale boundary is mocked, so it runs
-anywhere:
+Run the Rust unit tests and compile checks with Cargo:
 
 ```bash
-python3 -m unittest discover -s tests
+cargo test --locked
+cargo check --locked
 ```
 
-CI runs `py_compile` + the suite on Python 3.8 and 3.12. The live end-to-end
-smoke test needs a KVM host and is run manually / on a self-hosted runner.
+The live end-to-end smoke test needs a KVM host and network access for image
+pulls.
 
 ## What this POC does *not* do (yet)
 

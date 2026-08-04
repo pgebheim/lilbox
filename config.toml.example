@@ -1,5 +1,5 @@
 # lilexe config — copy to ~/.lilexe/config.toml
-# Flat key = value only (parsed stdlib-only; no nested tables).
+# Flat key = value configuration.
 
 # Defaults applied to `vm new` when the matching flag is omitted.
 image = "python"

@@ -15,22 +15,22 @@ binaries and the daemon bring-up.
 |---|---|
 | `Dockerfile` | `alpine:3.20` + `tailscale` (ships `tailscale` **and** `tailscaled`), `iproute2`, `ca-certificates`, `openssh`. |
 | `lilexe-boot` | First-boot hook: starts `tailscaled` on a **real kernel tun** (`/dev/net/tun` + `CAP_NET_ADMIN` are present in the libkrun guest), falling back to userspace networking only if tun is absent. Idempotent. |
-| `build.sh` | `docker build` → `docker save` → `msb load -t lilexe-box`. |
+| `build.sh` | `docker build` -> `docker save` -> native `vm image load`. |
 
 Tailscale version tracks the pinned Alpine release (`3.20` → tailscale `1.66.4`).
 Bump the `FROM` line to move it.
 
 ## Build & load
 
-microsandbox has no native image build — it consumes OCI images. Build with
-Docker and import the result into msb's local cache:
+microsandbox has no native image build; it consumes OCI images. Build with
+Docker and import the result through the Rust SDK:
 
 ```bash
-images/lilexe-box/build.sh          # docker build + msb load as `lilexe-box`
+images/lilexe-box/build.sh          # docker build + vm image load
 ```
 
-Requires `docker` (to build) and `msb` (to import). No registry needed — the
-image is loaded straight into msb's local cache under the tag `lilexe-box`.
+Requires `docker` (to build) and `vm` (to import). No registry is needed; the
+image is loaded straight into microsandbox's cache under the tag `lilexe-box`.
 
 ## Boot it
 
