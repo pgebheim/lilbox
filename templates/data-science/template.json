@@ -1,0 +1,6 @@
+{
+  "image": "quay.io/jupyter/scipy-notebook",
+  "memory": "4G",
+  "port": 8888,
+  "description": "Ready-to-use JupyterLab data-science box (pandas, numpy, scipy, scikit-learn, matplotlib) on CPU."
+}

@@ -69,6 +69,13 @@ pub(crate) fn templates(app: &App) -> Result<()> {
     let mut templates = vec![
         builtin_template("node-dev").unwrap(),
         builtin_template("python-dev").unwrap(),
+        builtin_template("rust-dev").unwrap(),
+        builtin_template("go-dev").unwrap(),
+        builtin_template("data-science").unwrap(),
+        builtin_template("ml-pytorch").unwrap(),
+        builtin_template("fullstack-web").unwrap(),
+        builtin_template("base-debian").unwrap(),
+        builtin_template("agent-sandbox").unwrap(),
     ];
     let user = app.templates_dir();
     if let Ok(entries) = fs::read_dir(user) {

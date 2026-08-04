@@ -1,0 +1,6 @@
+{
+  "image": "quay.io/jupyter/pytorch-notebook",
+  "memory": "4G",
+  "port": 8888,
+  "description": "PyTorch experimentation box with Jupyter; CPU by default (libkrun has no GPU passthrough)."
+}

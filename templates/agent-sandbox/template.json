@@ -1,0 +1,6 @@
+{
+  "image": "docker.io/library/debian:stable-slim",
+  "memory": "2G",
+  "port": 8000,
+  "description": "Agent-in-a-box: a polyglot scratch box to run an LLM/coding-agent's generated code where it can't hurt the host (on-theme with epic #21)."
+}

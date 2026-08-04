@@ -12,6 +12,34 @@ pub(crate) fn builtin_template(name: &str) -> Option<Template> {
             include_str!("../templates/node-dev/template.json"),
             include_str!("../templates/node-dev/setup.sh"),
         ),
+        "rust-dev" => (
+            include_str!("../templates/rust-dev/template.json"),
+            include_str!("../templates/rust-dev/setup.sh"),
+        ),
+        "go-dev" => (
+            include_str!("../templates/go-dev/template.json"),
+            include_str!("../templates/go-dev/setup.sh"),
+        ),
+        "data-science" => (
+            include_str!("../templates/data-science/template.json"),
+            include_str!("../templates/data-science/setup.sh"),
+        ),
+        "ml-pytorch" => (
+            include_str!("../templates/ml-pytorch/template.json"),
+            include_str!("../templates/ml-pytorch/setup.sh"),
+        ),
+        "fullstack-web" => (
+            include_str!("../templates/fullstack-web/template.json"),
+            include_str!("../templates/fullstack-web/setup.sh"),
+        ),
+        "base-debian" => (
+            include_str!("../templates/base-debian/template.json"),
+            include_str!("../templates/base-debian/setup.sh"),
+        ),
+        "agent-sandbox" => (
+            include_str!("../templates/agent-sandbox/template.json"),
+            include_str!("../templates/agent-sandbox/setup.sh"),
+        ),
         _ => return None,
     };
     Some(Template {
@@ -40,6 +68,20 @@ mod tests {
         let python = builtin_template("python-dev").unwrap();
         assert_eq!(python.manifest.image.as_deref(), Some("python"));
         assert!(python.setup.unwrap().contains("uv"));
+
+        let rust = builtin_template("rust-dev").unwrap();
+        assert_eq!(
+            rust.manifest.image.as_deref(),
+            Some("docker.io/library/rust:1-bookworm")
+        );
+        assert!(rust.setup.unwrap().contains("clippy"));
+
+        let go = builtin_template("go-dev").unwrap();
+        assert_eq!(
+            go.manifest.image.as_deref(),
+            Some("docker.io/library/golang:1.23-bookworm")
+        );
+        assert!(go.setup.unwrap().contains("gopls"));
     }
 
     #[test]
