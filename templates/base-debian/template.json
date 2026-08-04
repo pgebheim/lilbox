@@ -1,0 +1,5 @@
+{
+  "image": "mcr.microsoft.com/devcontainers/base:debian",
+  "memory": "2G",
+  "description": "Batteries-included but language-agnostic starter box (git, zsh, non-root vscode user, sudo) — a clean canvas for a custom setup.sh."
+}

@@ -136,8 +136,10 @@ template's other defaults). If a template has a `Dockerfile` (and no `image`),
 forces a fresh build. `setup.sh` runs post-boot; a non-zero exit is surfaced and
 logged to `~/.local/state/lilbox/logs/<box>-setup.log` (the box is kept for inspection).
 
-Shipped starters: **`python-dev`** (python + git + uv) and **`node-dev`**
-(node + npm + git).
+Shipped starters: **`python-dev`**, **`node-dev`**, **`rust-dev`**, **`go-dev`**,
+**`data-science`** & **`ml-pytorch`** (JupyterLab), **`fullstack-web`** (Node +
+Python), **`base-debian`**, and **`agent-sandbox`** — run `lilbox templates` for
+the full list, or add your own with `lilbox template add`.
 
 ## How publishing works
 

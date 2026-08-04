@@ -1,0 +1,6 @@
+{
+  "image": "docker.io/library/rust:1-bookworm",
+  "memory": "2G",
+  "port": 8000,
+  "description": "Rust toolchain box (cargo, rustc, clippy, rustfmt) — matches lilbox's own stack."
+}
