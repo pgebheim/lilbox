@@ -3,6 +3,7 @@ mod cp;
 mod lifecycle;
 mod net;
 mod new;
+mod template;
 mod view;
 
 use anyhow::Result;
@@ -18,6 +19,7 @@ pub(crate) async fn dispatch(app: &App, command: Command) -> Result<i32> {
         Command::Ls { json } => view::ls(app, json).await?,
         Command::Gc => lifecycle::gc(app).await?,
         Command::Templates => view::templates(app)?,
+        Command::Template(args) => template::cmd_template(app, args.command)?,
         Command::Provision { name } => lifecycle::provision_cmd(app, name).await?,
         Command::Exec(args) => return sandbox::exec(app, args).await,
         Command::Ssh(args) => return sandbox::ssh(app, args).await,

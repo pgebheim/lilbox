@@ -28,6 +28,8 @@ pub(crate) enum Command {
     Gc,
     /// List available templates.
     Templates,
+    /// Manage user-installed templates.
+    Template(TemplateArgs),
     /// Re-run a box template's setup script.
     Provision { name: String },
     /// Run a command in a box.
@@ -101,6 +103,28 @@ pub(crate) enum ImageCommand {
     },
     /// List cached images.
     Ls,
+}
+
+#[derive(Args)]
+pub(crate) struct TemplateArgs {
+    #[command(subcommand)]
+    pub(crate) command: TemplateCommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum TemplateCommand {
+    /// Install a template from a git URL or a local directory.
+    Add {
+        source: String,
+        /// Name to install the template under (default: derived from source).
+        #[arg(long)]
+        name: Option<String>,
+        /// Overwrite an existing template with the same name.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove an installed user template.
+    Remove { name: String },
 }
 
 #[derive(Args)]
