@@ -149,6 +149,26 @@ lilbox exec mybox -- tailscale version  # tailscale is baked in
 
 See [`images/lilbox-box/README.md`](images/lilbox-box/README.md) for details.
 
+## Tailnet ACLs
+
+Boxes join the tailnet tagged `tag:lilbox-vm`. Before boxes can join and be
+reached over Tailscale SSH, add the following to your tailnet's ACL policy:
+
+```jsonc
+"tagOwners": { "tag:lilbox-vm": ["autogroup:admin"] },
+"ssh": [
+  { "action": "accept", "src": ["autogroup:member"], "dst": ["tag:lilbox-vm"], "users": ["root", "autogroup:nonroot"] }
+]
+```
+
+- `tagOwners` lets an admin identity mint auth keys that carry `tag:lilbox-vm`.
+- The `ssh` stanza grants Tailscale SSH from tailnet members to any node
+  tagged `tag:lilbox-vm`.
+
+Boxes join as **ephemeral** nodes, so a node auto-deregisters once it goes
+offline; `lilbox rm` also logs the node out directly (best-effort) so it's
+removed from the tailnet immediately rather than waiting for it to age out.
+
 ## Persistent volumes (devboxes)
 
 Every `lilbox new` box gets a named microsandbox volume `lilbox-<name>-home` mounted at

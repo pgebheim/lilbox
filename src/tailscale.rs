@@ -121,6 +121,12 @@ pub(crate) fn tailscale_ssh_args(node: &str, cmd: &[String]) -> Vec<String> {
     args
 }
 
+/// Guest exec argv to log a box's tailnet node out, so an ephemeral node
+/// deregisters immediately instead of waiting for it to go offline.
+pub(crate) fn tailscale_logout_args() -> [&'static str; 1] {
+    ["logout"]
+}
+
 pub(crate) fn allocate_serve_port(app: &App, public: bool) -> Result<u16> {
     let ts = app
         .tailscale
@@ -290,6 +296,11 @@ mod tests {
                 "-la".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn tailscale_logout_args_is_just_logout() {
+        assert_eq!(tailscale_logout_args(), ["logout"]);
     }
 
     #[test]
