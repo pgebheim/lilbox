@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     io::{self, IsTerminal, Read, Write},
+    process::Command as ProcessCommand,
     thread,
 };
 
@@ -12,6 +13,7 @@ use microsandbox::{
 
 use crate::app::App;
 use crate::cli::{ExecArgs, RunArgs};
+use crate::tailscale::tailscale_ssh_args;
 use crate::util::{parse_duration, random_name};
 
 const DEFAULT_HOME: &str = "/root";
@@ -183,6 +185,15 @@ pub(crate) async fn exec(app: &App, args: ExecArgs) -> Result<i32> {
 }
 
 pub(crate) async fn ssh(app: &App, args: ExecArgs) -> Result<i32> {
+    let row = app.require_row(&args.name)?;
+    if let (Some(node), Some(ts)) = (row.tailscale_node.as_deref(), app.tailscale.as_deref()) {
+        let status = ProcessCommand::new(ts)
+            .args(tailscale_ssh_args(node, &args.cmd))
+            .status()
+            .with_context(|| format!("could not run '{}'", ts.display()))?;
+        return Ok(status.code().unwrap_or(1));
+    }
+
     let sandbox = connect_box(app, &args.name, true).await?;
     if args.cmd.is_empty() {
         return Ok(sandbox.attach_shell().await?);

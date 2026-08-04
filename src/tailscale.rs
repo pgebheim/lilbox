@@ -114,6 +114,13 @@ pub(crate) fn box_display_url(
         .or_else(|| expose_url.map(String::from))
 }
 
+/// Args for `tailscale ssh` to a box node: ["ssh", "root@<node>", <cmd...>]
+pub(crate) fn tailscale_ssh_args(node: &str, cmd: &[String]) -> Vec<String> {
+    let mut args = vec!["ssh".to_string(), format!("root@{node}")];
+    args.extend(cmd.iter().cloned());
+    args
+}
+
 pub(crate) fn allocate_serve_port(app: &App, public: bool) -> Result<u16> {
     let ts = app
         .tailscale
@@ -261,6 +268,28 @@ mod tests {
     #[test]
     fn box_display_url_none_when_neither() {
         assert_eq!(box_display_url(None, None), None);
+    }
+
+    #[test]
+    fn tailscale_ssh_args_interactive() {
+        assert_eq!(
+            tailscale_ssh_args("web.tail1.ts.net", &[]),
+            vec!["ssh".to_string(), "root@web.tail1.ts.net".to_string()]
+        );
+    }
+
+    #[test]
+    fn tailscale_ssh_args_with_command() {
+        let cmd = vec!["ls".to_string(), "-la".to_string()];
+        assert_eq!(
+            tailscale_ssh_args("web.tail1.ts.net", &cmd),
+            vec![
+                "ssh".to_string(),
+                "root@web.tail1.ts.net".to_string(),
+                "ls".to_string(),
+                "-la".to_string()
+            ]
+        );
     }
 
     #[test]
