@@ -98,6 +98,6 @@ async fn best_effort_tailnet_logout(name: &str) {
     }
     .await;
     if let Err(err) = result {
-        eprintln!("warning: could not log out tailnet node for '{name}': {err}");
+        eprintln!("warning: could not log out tailnet node for '{name}': {err:#}");
     }
 }

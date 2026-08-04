@@ -19,6 +19,14 @@ pub(crate) struct BoxRow {
     pub(crate) tailscale_node: Option<String>,
 }
 
+impl BoxRow {
+    /// The box's preferred display URL: its MagicDNS URL if it joined the
+    /// tailnet, else its expose/serve URL.
+    pub(crate) fn display_url(&self) -> Option<String> {
+        crate::tailscale::box_display_url(self.tailscale_node.as_deref(), self.url.as_deref())
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct TemplateManifest {
     pub(crate) image: Option<String>,
