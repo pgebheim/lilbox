@@ -1,0 +1,118 @@
+name: Release
+
+# Tag push (v*) builds + publishes a GitHub Release. workflow_dispatch lets us
+# probe a target (esp. macOS) build in isolation before ever pushing a tag —
+# it builds/packages/uploads workflow artifacts but does not touch Releases.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Native runner per target - no cross-compiling. macOS in particular
+        # needs a real Apple Silicon host: the `prebuilt` feature fetches
+        # microsandbox's libkrunfw-darwin-aarch64.dylib (HVF backend) at
+        # build time, and that bundle only exists for aarch64-apple-darwin
+        # (Intel macOS is unsupported upstream - see issue #62 spike).
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-14
+          # Optional bonus target: GitHub's hosted arm64 Ubuntu runner makes
+          # this a native build too, so it's included with no QEMU/cross
+          # gymnastics required.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        # microsandbox's VMM (msb-krun -> caps/capng) links against
+        # libcap-ng, which isn't preinstalled on the GitHub runner (mirrors
+        # the system-deps step in ci.yml).
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        # Builds and strips the binary (see `[profile.release] strip = true`
+        # in Cargo.toml). This step only produces the artifact - actually
+        # booting a box needs a real HVF (macOS) / KVM (Linux) host, so
+        # runtime smoke tests (`lilbox doctor`, booting a box) stay a
+        # manual/self-hosted check, same as ci.yml already documents.
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package archive
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          target="${{ matrix.target }}"
+          name="lilbox-${version}-${target}"
+          archive="${name}.tar.gz"
+
+          stage="$(mktemp -d)/${name}"
+          mkdir -p "$stage"
+          cp "target/${target}/release/lilbox" "$stage/lilbox"
+          cp LICENSE README.md "$stage/"
+
+          tar -czf "$archive" -C "$(dirname "$stage")" "$(basename "$stage")"
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.archive }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > checksums.sha256
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/checksums.sha256
