@@ -9,9 +9,9 @@ use crate::cli::NewArgs;
 use crate::provision::{build_template_image, provision};
 use crate::sandbox::{SandboxSettings, configure_builder, with_secret_env, with_secret_value};
 use crate::tailscale::{
-    CONTROL_PLANE_HOST, DEFAULT_AUTH_KEY_ENV, JoinMode, is_valid_env_var_name, mint_ephemeral_key,
-    node_hostname, require_auth_key, resolve_join_mode, resolve_tag, tailscale_up_command,
-    validate_tag,
+    CONTROL_PLANE_HOST, DEFAULT_AUTH_KEY_ENV, JoinMode, is_valid_env_var_name, join_failure_detail,
+    mint_ephemeral_key, node_hostname, require_auth_key, resolve_join_mode, resolve_tag,
+    tailscale_up_command, validate_tag,
 };
 use crate::util::{
     DEFAULT_GUEST_PORT, DEFAULT_IMAGE, alloc_host_port, now, parse_duration, parse_memory,
@@ -162,10 +162,13 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
         builder = with_secret_env(builder, &key_env, CONTROL_PLANE_HOST);
     }
     drop(minted_key);
-    let sandbox = builder
-        .create_detached()
-        .await
-        .with_context(|| "microsandbox create failed")?;
+    let sandbox = builder.create_detached().await.with_context(|| {
+        format!(
+            "could not create box '{name}' from image '{image}' \
+             (if '{image}' is a locally-built image, load it first — \
+             e.g. images/<name>/build.sh — and check `lilbox image ls`)"
+        )
+    })?;
     app.db.execute(
         "INSERT INTO boxes(name,image,guest_port,host_port,created,template,volume,expires) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
         params![name, image, guest_port, host_port, Local::now().format("%Y-%m-%d %H:%M:%S").to_string(), template.as_ref().map(|t| &t.name), volume, expires],
@@ -186,7 +189,11 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
             }
             Ok(output) => eprintln!(
                 "warning: could not join tailnet for '{name}': {}",
-                output.stderr().unwrap_or_default().trim()
+                join_failure_detail(
+                    output.status().code,
+                    &output.stderr().unwrap_or_default(),
+                    &image,
+                )
             ),
             Err(error) => {
                 eprintln!("warning: could not join tailnet for '{name}': {error}")

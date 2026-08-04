@@ -94,6 +94,26 @@ tailscale status --json"
     ]
 }
 
+/// Explain a failed tailnet join from the guest exit code + stderr.
+///
+/// `stderr` wins when non-empty (it's the real `tailscale up` error for exit
+/// 5). Otherwise the message is keyed on the exit code the join script in
+/// [`tailscale_up_command`] uses: `3` = no `tailscaled` in the image, `4` =
+/// `lilbox-boot` (tailscaled start) failed.
+pub(crate) fn join_failure_detail(code: i32, stderr: &str, image: &str) -> String {
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        return stderr.to_string();
+    }
+    match code {
+        3 => format!(
+            "image '{image}' has no tailscaled — use --image lilbox-box (or an image with Tailscale baked in)"
+        ),
+        4 => "tailscaled failed to start in the guest".to_string(),
+        _ => format!("tailscale up exited with status {code}"),
+    }
+}
+
 pub(crate) fn serve_ports(ts: &Path) -> HashSet<u16> {
     let mut ports = HashSet::new();
     let Ok(out) = successful_output(ts, &["serve", "status", "--json"]) else {
@@ -616,5 +636,28 @@ mod tests {
     #[test]
     fn parse_minted_key_errs_on_missing_field() {
         assert!(parse_minted_key(r#"{"id":"k1"}"#).is_err());
+    }
+
+    #[test]
+    fn join_failure_detail_no_tailscaled_names_lilbox_box() {
+        let detail = join_failure_detail(3, "", "python");
+        assert!(detail.contains("lilbox-box"));
+        assert!(detail.contains("python"));
+    }
+
+    #[test]
+    fn join_failure_detail_boot_failure_names_tailscaled() {
+        let detail = join_failure_detail(4, "", "lilbox-box");
+        assert!(detail.contains("tailscaled"));
+    }
+
+    #[test]
+    fn join_failure_detail_prefers_stderr_over_canned_message() {
+        for code in [3, 4, 5, 1] {
+            assert_eq!(
+                join_failure_detail(code, "  tailscale up: some real error  ", "python"),
+                "tailscale up: some real error"
+            );
+        }
     }
 }

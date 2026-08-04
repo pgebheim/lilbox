@@ -199,6 +199,31 @@ skip the tailnet join entirely. Any minting failure (bad credentials, network
 error, malformed response) only prints a warning and skips the join — it
 never fails `lilbox new`.
 
+## Quickstart: a box on your tailnet
+
+Prereqs (once): the [Tailnet ACLs](#tailnet-acls) in place, a Tailscale
+credential, and the [`lilbox-box`](#boxes-with-tailscale-baked-in-lilbox-box)
+image (the default `python` image has no `tailscaled`).
+
+1. Build the image: `images/lilbox-box/build.sh`
+2. Pick a credential — OAuth (recommended: mints a fresh, 5-minute key per
+   box) via `oauthClientId` in `[tailscale]` plus
+   `export TS_OAUTH_CLIENT_SECRET=...`; or a static, ephemeral,
+   pre-authorized `tag:lilbox-vm` key via `export TS_AUTHKEY=tskey-auth-...`.
+   See [OAuth-minted keys vs. a static auth
+   key](#joining-the-tailnet-oauth-minted-keys-vs-a-static-auth-key) for the
+   tradeoffs.
+3. `lilbox new dev --image lilbox-box`
+4. Use it:
+   - `lilbox url dev` → `https://dev.<tailnet>.ts.net/`, serving the app on
+     guest port 8000
+   - `lilbox ssh dev` — Tailscale SSH, keyless
+5. `lilbox rm dev` — deregisters the node.
+
+Troubleshooting: a `could not join tailnet` warning is almost always the
+image (it must be tailscaled-capable — use `lilbox-box`) or a missing/rejected
+credential.
+
 ## Persistent volumes (devboxes)
 
 Every `lilbox new` box gets a named microsandbox volume `lilbox-<name>-home` mounted at
