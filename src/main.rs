@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod logs;
 mod model;
+mod overlay;
 mod provision;
 mod sandbox;
 mod tailscale;

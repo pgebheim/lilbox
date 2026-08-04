@@ -5,6 +5,7 @@ use microsandbox::{Image, Sandbox, Volume};
 
 use crate::app::App;
 use crate::cli::ImageCommand;
+use crate::overlay;
 use crate::sandbox::{status_name, statuses};
 use crate::tailscale::tailnet_host;
 use crate::templates::builtin_template;
@@ -147,6 +148,11 @@ pub(crate) async fn image(command: ImageCommand) -> Result<()> {
                         .unwrap_or_else(|| "-".into())
                 );
             }
+        }
+        ImageCommand::Overlay { base, tag } => {
+            let extra_files = vec![("etc/lilbox-overlay".to_string(), b"v1\n".to_vec())];
+            overlay::overlay_image(&base, &extra_files, &tag).await?;
+            println!("overlaid {base} as {tag}");
         }
     }
     Ok(())

@@ -103,6 +103,12 @@ pub(crate) enum ImageCommand {
     },
     /// List cached images.
     Ls,
+    /// Pull a base image, append a marker layer, and load it under a new tag.
+    Overlay {
+        base: String,
+        #[arg(long)]
+        tag: String,
+    },
 }
 
 #[derive(Args)]
