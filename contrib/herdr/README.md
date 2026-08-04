@@ -1,0 +1,133 @@
+# lilbox plugin for herdr
+
+Run each [herdr](https://herdr.dev) worktree's coding agent inside its own
+lilbox microVM — a real KVM-isolated kernel on hardware you own — and tear the
+box down with the worktree.
+
+herdr is an agent multiplexer: persistent workspaces, tabs, panes, and automatic
+agent state detection. It runs agents; it doesn't isolate them. lilbox isolates;
+it has no multiplexer. This plugin is the seam.
+
+Every other sandbox-backed herdr plugin delegates isolation to someone else's
+cloud (E2B, Sprites, Hetzner). This one runs on your box, bind-mounts the live
+worktree instead of shuttling snapshots, and costs nothing per hour.
+
+## Requirements
+
+- Linux host with KVM — microsandbox boots libkrun microVMs (`lilbox doctor`)
+- `lilbox` on `PATH`
+- herdr **0.7.0+**
+- `jq` — herdr hands plugins their context as JSON
+
+## Install
+
+```bash
+herdr plugin install pgebheim/lilbox/contrib/herdr
+```
+
+Developing against a checkout instead:
+
+```bash
+herdr plugin link /path/to/lilbox/contrib/herdr
+herdr plugin action list --plugin lilbox
+```
+
+Bind a key by adding to your herdr config:
+
+```toml
+[[keys.command]]
+key = "prefix+shift+b"
+type = "plugin_action"
+command = "lilbox.open"
+description = "open lilbox"
+
+[[keys.command]]
+key = "prefix+shift+a"
+type = "plugin_action"
+command = "lilbox.agent"
+description = "run agent in lilbox"
+```
+
+## Use
+
+| Action | Does |
+|---|---|
+| `lilbox.open` | Boot (or reuse) this worktree's box, shell in at `/workspace` |
+| `lilbox.agent` | Same box, exec straight into the coding agent |
+| `lilbox.boxes` | Live overlay of every box (`lilbox ls`) |
+| `lilbox.status` | This worktree's box name, status, and URL |
+| `lilbox.expose` | Publish the box over tailnet HTTPS, print the URL |
+| `lilbox.unexpose` | Stop publishing |
+| `lilbox.kill` | Destroy the box and its home volume |
+
+Invoke any of them from herdr's action menu, a keybinding, or:
+
+```bash
+herdr plugin action invoke lilbox.open
+```
+
+The `agent` pane is the one that matters for herdr: it runs the agent on a real
+PTY inside the microVM, which is what herdr's state detection (working /
+blocked / done / idle) reads. The agent edits your actual worktree files —
+`/workspace` is a bind mount, not a copy, so there's no sync step in either
+direction.
+
+Ctrl+click a published `*.ts.net` URL in any pane to shell into the box serving
+it.
+
+## One box per worktree
+
+The box name is derived from the worktree's absolute path:
+`hd-<slug>-<6 hex of sha256(path)>`. Two consequences worth knowing:
+
+- **Reuse is automatic.** Re-opening the pane attaches to the existing box
+  instead of booting a second one; a stopped box is started.
+- **Teardown needs no bookkeeping.** The `worktree.removed` hook fires *after*
+  the directory is gone, so a mapping file would be the only way to know which
+  box to destroy — and a stale one leaks microVMs. Deriving the name from the
+  path in the event payload means there's nothing to keep in sync.
+
+The path hash is also what keeps a repo and its `feature/` worktree — same
+basename — from colliding onto, and tearing down, each other's box.
+
+## Configuration
+
+`herdr plugin config-dir lilbox` prints the config directory. Drop a
+`config.env` there; it's sourced before every command.
+
+```sh
+# config.env — all optional, defaults shown
+LILBOX_BIN=lilbox          # path to the lilbox binary
+LILBOX_IMAGE=python        # image for new boxes; lilbox-box adds tailnet identity
+LILBOX_AGENT_CMD=claude    # what the agent pane execs
+LILBOX_SHELL=bash          # what the shell pane execs
+LILBOX_AGENT_ARGS=         # extra `lilbox agent` flags, e.g. --agents-file /path/AGENTS.md
+```
+
+Use `LILBOX_IMAGE=lilbox-box` to give every box its own tailnet node — then
+`lilbox ssh` is keyless Tailscale SSH and each box gets its own hostname. See
+the root README's [`lilbox-box`](../../images/lilbox-box/README.md) section.
+
+The agent needs credentials: `lilbox agent` injects `ANTHROPIC_API_KEY` from
+your environment as a scoped secret when it's set, so export it wherever the
+herdr server starts.
+
+## Running the shim directly
+
+`bin/lilbox-herdr` works outside herdr, operating on the current directory:
+
+```bash
+contrib/herdr/bin/lilbox-herdr name      # box name for $PWD
+contrib/herdr/bin/lilbox-herdr status
+contrib/herdr/bin/lilbox-herdr open
+```
+
+Inside herdr it deliberately refuses to fall back to `$PWD` — herdr runs plugin
+commands with the *plugin directory* as the working directory, so a fallback
+would quietly box up the plugin's own source tree.
+
+## Trust
+
+herdr plugins run as your user with your environment. This one shells out to
+`lilbox` and `jq` and calls back into herdr through `HERDR_BIN_PATH`; it is a
+manifest and one script, and reading them is the intended way to vet it.

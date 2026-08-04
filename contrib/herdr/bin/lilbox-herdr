@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# lilbox <-> herdr shim. One microVM per worktree, named deterministically from
+# the worktree path so every entrypoint — and the teardown hook, which fires
+# after the directory is already gone — agrees on which box is which without
+# keeping a mapping file.
+#
+# Herdr runs plugin commands as a bare argv (no shell) with the plugin directory
+# as $PWD, so the worktree is read from HERDR_PLUGIN_CONTEXT_JSON, not from $PWD.
+set -euo pipefail
+
+readonly WORKDIR=/workspace
+readonly NAME_PREFIX=hd
+readonly PENDING_TTL=60 # seconds a link-click box handoff stays valid
+
+usage() {
+	cat >&2 <<'EOF'
+usage: lilbox-herdr <command>
+
+  open        boot/reuse this worktree's box and open a shell at /workspace
+  agent       same, but exec the coding agent instead of a shell
+  watch       live-refreshing list of every lilbox
+  status      print this worktree's box record
+  expose      publish the box over tailnet HTTPS (and print the URL)
+  unexpose    stop publishing the box
+  kill        destroy the box and its home volume
+  name        print the box name derived from this worktree
+  open-url    open the box serving HERDR_PLUGIN_CLICKED_URL (link handler)
+  teardown    destroy the box for the removed worktree (worktree.removed hook)
+
+Outside herdr these all operate on the current directory.
+EOF
+}
+
+die() {
+	printf 'lilbox-herdr: %s\n' "$*" >&2
+	exit 1
+}
+
+# --- config -----------------------------------------------------------------
+# User-editable, seeded on first run. `herdr plugin config-dir lilbox` prints it.
+load_config() {
+	local dir=${HERDR_PLUGIN_CONFIG_DIR:-}
+	if [ -n "$dir" ] && [ -f "$dir/config.env" ]; then
+		# shellcheck disable=SC1091  # user file, path known only at runtime
+		. "$dir/config.env"
+	fi
+	LILBOX_BIN=${LILBOX_BIN:-lilbox}
+	LILBOX_IMAGE=${LILBOX_IMAGE:-python}
+	LILBOX_AGENT_CMD=${LILBOX_AGENT_CMD:-claude}
+	LILBOX_SHELL=${LILBOX_SHELL:-bash}
+	# Extra flags for `lilbox agent` at provision time, e.g. "--agents-file
+	# /path/AGENTS.md". Word-split on purpose.
+	LILBOX_AGENT_ARGS=${LILBOX_AGENT_ARGS:-}
+}
+
+lilbox() { command "$LILBOX_BIN" "$@"; }
+
+herdr_bin() { printf '%s' "${HERDR_BIN_PATH:-herdr}"; }
+
+notify() {
+	[ -n "${HERDR_ENV:-}" ] || return 0
+	"$(herdr_bin)" notification show lilbox --body "$1" >/dev/null 2>&1 || true
+}
+
+require() {
+	command -v "$1" >/dev/null 2>&1 ||
+		die "$1 is required but not on PATH${2:+ ($2)}"
+}
+
+# --- identity ---------------------------------------------------------------
+# hd-<slug>-<6 hex of sha256(path)>. The hash is what keeps two worktrees that
+# happen to share a basename (a repo and its `feature` worktree, say) from
+# colliding onto — and tearing down — the same box.
+box_name() {
+	local path=$1 slug hash
+	slug=$(printf '%s' "${path##*/}" |
+		tr '[:upper:]' '[:lower:]' |
+		tr -c 'a-z0-9' '-' |
+		sed -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')
+	slug=${slug:0:16}
+	slug=${slug:-box}
+	hash=$(printf '%s' "$path" | sha256sum | cut -c1-6)
+	printf '%s-%s-%s' "$NAME_PREFIX" "$slug" "$hash"
+}
+
+# The worktree this invocation is about. Prefer herdr's context; fall back to
+# $PWD only when running outside herdr, since inside herdr $PWD is the plugin
+# directory and would silently box up the plugin's own source tree.
+worktree_path() {
+	local ctx=${HERDR_PLUGIN_CONTEXT_JSON:-} path=
+	if [ -n "$ctx" ]; then
+		path=$(printf '%s' "$ctx" | jq -r '
+			.worktree.checkout_path // .workspace_cwd // .focused_pane_cwd // empty
+		' 2>/dev/null) || path=
+	fi
+	if [ -z "$path" ]; then
+		# HERDR_PLUGIN_ID is injected only into plugin invocations. HERDR_ENV is
+		# set in every herdr pane, so it can't tell "herdr ran me as a plugin"
+		# from "a human ran me by hand in a herdr pane" — and only the former
+		# has the plugin dir as $PWD.
+		[ -z "${HERDR_PLUGIN_ID:-}" ] ||
+			die "herdr gave no worktree in HERDR_PLUGIN_CONTEXT_JSON; open a workspace first"
+		path=$PWD
+	fi
+	canonical_path "$path"
+}
+
+# Every path that reaches box_name goes through here, so /home/me/./p, a
+# symlinked parent, and the raw path all derive the same box. `realpath -m`
+# rather than `cd && pwd -P` because the teardown hook has to canonicalize a
+# worktree that has *already been deleted* — and if it resolved differently from
+# the path that created the box, teardown would silently orphan a microVM.
+canonical_path() {
+	realpath -m -- "$1" 2>/dev/null || printf '%s' "$1"
+}
+
+# --- box state --------------------------------------------------------------
+# "" when lilbox has no record of the box at all, else its status word.
+box_status() {
+	lilbox ls --json 2>/dev/null |
+		jq -r --arg n "$1" '.[] | select(.name == $n) | .status' 2>/dev/null |
+		head -n1
+}
+
+box_url() {
+	lilbox ls --json 2>/dev/null |
+		jq -r --arg n "$1" '.[] | select(.name == $n) | .tailnet_url // .url // empty' 2>/dev/null |
+		head -n1
+}
+
+# Boot the box if it's missing, wake it if it's stopped. Idempotent: re-opening
+# a pane reuses the box rather than booting a second one.
+ensure_box() {
+	local name=$1 path=$2 status
+	status=$(box_status "$name")
+	case $status in
+	running) return 0 ;;
+	"" | gone)
+		[ -d "$path" ] || die "worktree is gone: $path"
+		printf 'booting %s for %s ...\n' "$name" "$path"
+		# Unquoted on purpose: LILBOX_AGENT_ARGS is a flag string.
+		# shellcheck disable=SC2086
+		lilbox agent "$name" --workspace "$path" --image "$LILBOX_IMAGE" $LILBOX_AGENT_ARGS
+		;;
+	*)
+		printf 'starting %s (was %s) ...\n' "$name" "$status"
+		lilbox start "$name"
+		;;
+	esac
+}
+
+# Run a command inside the box on a real PTY. `lilbox ssh` attaches via Tailscale
+# SSH when the box is a tailnet node and falls back to a direct attach otherwise;
+# both give herdr the terminal it needs for agent state detection.
+attach() {
+	local name=$1 inner=$2
+	exec lilbox ssh "$name" -- sh -lc "cd $WORKDIR 2>/dev/null || true; $inner"
+}
+
+# --- link-click handoff -----------------------------------------------------
+# A link handler action can't hand a box name to a pane entrypoint directly, so
+# `open-url` parks the resolved name and the next `open` consumes it.
+pending_file() {
+	local dir=${HERDR_PLUGIN_STATE_DIR:-}
+	[ -n "$dir" ] || return 1
+	mkdir -p "$dir" 2>/dev/null || return 1
+	printf '%s/pending-box' "$dir"
+}
+
+take_pending_box() {
+	local file now mtime name
+	file=$(pending_file) || return 1
+	[ -f "$file" ] || return 1
+	now=$(date +%s)
+	# Read the mtime before consuming the file, or the staleness check is a no-op.
+	mtime=$(stat -c %Y "$file" 2>/dev/null || printf '%s' "$now")
+	name=$(cat "$file" 2>/dev/null) || name=
+	rm -f "$file" 2>/dev/null || true
+	[ -n "$name" ] || return 1
+	[ "$((now - mtime))" -le "$PENDING_TTL" ] || return 1
+	printf '%s' "$name"
+}
+
+# --- commands ---------------------------------------------------------------
+cmd_open() {
+	local inner=$1 name path
+	if name=$(take_pending_box); then
+		# Came from a link click: the box already exists, just get in.
+		attach "$name" "$inner"
+	fi
+	path=$(worktree_path)
+	name=$(box_name "$path")
+	ensure_box "$name" "$path"
+	attach "$name" "$inner"
+}
+
+# Note the two-step `path=$(worktree_path)` in every command below. Inlining it
+# as `box_name "$(worktree_path)"` would swallow a failed lookup: `set -e` does
+# not fire for a command substitution used as an argument, so a die() inside it
+# only kills the subshell and the caller carries on with an empty path — which
+# hashes to a real-looking box name.
+cmd_name() {
+	local path
+	path=$(worktree_path)
+	box_name "$path"
+	printf '\n'
+}
+
+cmd_watch() {
+	require watch "coreutils"
+	exec watch -t -n 2 "$LILBOX_BIN" ls
+}
+
+cmd_status() {
+	local path name status url
+	path=$(worktree_path)
+	name=$(box_name "$path")
+	status=$(box_status "$name")
+	url=$(box_url "$name")
+	printf 'worktree  %s\nbox       %s\nstatus    %s\nurl       %s\n' \
+		"$path" "$name" "${status:-none}" "${url:--}"
+	[ -n "$status" ] || return 0
+	lilbox stat "$name" || true
+}
+
+cmd_expose() {
+	local path name url
+	path=$(worktree_path)
+	name=$(box_name "$path")
+	ensure_box "$name" "$path"
+	lilbox expose "$name"
+	url=$(box_url "$name")
+	[ -z "$url" ] || notify "$name published at $url"
+}
+
+cmd_unexpose() {
+	local path name
+	path=$(worktree_path)
+	name=$(box_name "$path")
+	lilbox unexpose "$name"
+}
+
+cmd_kill() {
+	local path name status
+	path=$(worktree_path)
+	name=$(box_name "$path")
+	status=$(box_status "$name")
+	[ -n "$status" ] || die "no box for this worktree ($name)"
+	lilbox rm "$name"
+	notify "$name destroyed"
+}
+
+# Ctrl+click on a published URL -> shell into whichever box serves it.
+cmd_open_url() {
+	local url name file
+	url=${HERDR_PLUGIN_CLICKED_URL:-}
+	[ -n "$url" ] || die "no clicked URL in HERDR_PLUGIN_CLICKED_URL"
+	name=$(lilbox ls --json 2>/dev/null |
+		jq -r --arg u "$url" '
+			.[] | select((.tailnet_url // "") != "" and ($u | startswith(.tailnet_url))
+			          or ((.url // "") != "" and ($u | startswith(.url))))
+			| .name
+		' 2>/dev/null | head -n1)
+	[ -n "$name" ] || die "no lilbox is serving $url"
+	file=$(pending_file) || die "no plugin state dir to hand off through"
+	printf '%s' "$name" >"$file"
+	"$(herdr_bin)" plugin pane open --plugin "${HERDR_PLUGIN_ID:-lilbox}" --entrypoint box
+}
+
+# worktree.removed hook. The directory is already gone, so the name has to come
+# from the event payload's path — which is exactly what deterministic naming
+# buys us: no mapping file to keep in sync, nothing to leak if one goes stale.
+cmd_teardown() {
+	local ev path name status
+	ev=${HERDR_PLUGIN_EVENT_JSON:-}
+	[ -n "$ev" ] || exit 0
+	path=$(printf '%s' "$ev" | jq -r '
+		.data.worktree.path // [.. | objects | .path? // empty | strings][0] // empty
+	' 2>/dev/null) || exit 0
+	[ -n "$path" ] || exit 0
+	path=$(canonical_path "$path")
+	name=$(box_name "$path")
+	status=$(box_status "$name")
+	[ -n "$status" ] || exit 0 # no box for this worktree — nothing to do
+	if lilbox rm "$name" >/dev/null 2>&1; then
+		notify "$name torn down with its worktree"
+	else
+		# Leave the box rather than pretend it's gone; the worktree is already
+		# removed, so this is the only place the name is still recoverable.
+		notify "couldn't destroy $name — retry: lilbox rm $name"
+	fi
+	exit 0
+}
+
+main() {
+	load_config
+	local cmd=${1:-}
+	[ $# -eq 0 ] || shift
+	case $cmd in
+	open | agent | status | expose | unexpose | kill | name | open-url | teardown)
+		require jq "install jq to parse herdr's context JSON"
+		require "$LILBOX_BIN" "install lilbox, or set LILBOX_BIN in config.env"
+		;;
+	esac
+	case $cmd in
+	open) cmd_open "exec $LILBOX_SHELL -l" ;;
+	agent) cmd_open "exec $LILBOX_AGENT_CMD" ;;
+	watch) cmd_watch ;;
+	status) cmd_status ;;
+	expose) cmd_expose ;;
+	unexpose) cmd_unexpose ;;
+	kill) cmd_kill ;;
+	name) cmd_name ;;
+	open-url) cmd_open_url ;;
+	teardown) cmd_teardown ;;
+	-h | --help | help) usage ;;
+	"") usage && exit 2 ;;
+	*) die "unknown command: $cmd" ;;
+	esac
+}
+
+main "$@"
