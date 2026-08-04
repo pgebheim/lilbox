@@ -7,10 +7,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The one identifier that is allowed to still say "lilexe": the GitHub repo
-/// slug, which can't be renamed here until the repo itself is renamed.
-const ALLOWED_SLUG: &str = "pgebheim/lilexe";
-
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -37,32 +33,13 @@ fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Find every case-insensitive occurrence of "lilexe" in `content` that is
-/// NOT part of the allowed repo slug, and append `path:line` entries for
-/// each offending line to `offenses`.
+/// Append a `path:line` entry for every line containing a case-insensitive
+/// occurrence of "lilexe". The repo has been renamed to lilbox, so there is
+/// no longer any allowed exception.
 fn find_lilexe_offenses(path: &Path, content: &str, offenses: &mut Vec<String>) {
-    let needle = "lilexe";
-    let slug_lower = ALLOWED_SLUG.to_lowercase();
-
     for (idx, line) in content.lines().enumerate() {
-        let lower = line.to_lowercase();
-        let mut start = 0usize;
-
-        while let Some(rel_pos) = lower[start..].find(needle) {
-            let abs_pos = start + rel_pos;
-
-            let slug_start = abs_pos + needle.len();
-            let is_part_of_allowed_slug = slug_start >= slug_lower.len()
-                && lower.is_char_boundary(slug_start - slug_lower.len())
-                && lower[slug_start - slug_lower.len()..slug_start].eq(slug_lower.as_str());
-
-            if is_part_of_allowed_slug {
-                start = abs_pos + needle.len();
-                continue;
-            }
-
+        if line.to_lowercase().contains("lilexe") {
             offenses.push(format!("{}:{}", path.display(), idx + 1));
-            break;
         }
     }
 }
