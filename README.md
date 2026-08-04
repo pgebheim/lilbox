@@ -44,6 +44,22 @@ lilbox doctor               # verify the runtime
 
 For development, use `cargo run -- <command>`.
 
+## Where lilbox keeps its state
+
+`lilbox` follows the XDG base directory layout (via the `dirs` crate, so it's
+per-OS — paths below are the Linux defaults):
+
+| kind | dir | contents |
+|---|---|---|
+| config | `~/.config/lilbox/` | `config.toml` |
+| state | `~/.local/state/lilbox/` | `state.db`, `logs/` |
+| data | `~/.local/share/lilbox/` | `templates/`, `workspaces/` |
+
+Upgrading from an older `lilbox` that used a single `~/.lilbox/` dotdir? The
+first run after upgrading moves its contents into the dirs above
+automatically (best-effort, with a one-line notice); `~/.lilbox` itself is
+left behind, empty.
+
 ## Quickstart
 
 ```bash
@@ -112,13 +128,13 @@ lilbox new dev --template python-dev   # boot from a template
 lilbox provision dev                   # re-run its setup (idempotent)
 ```
 
-Resolution: user templates in `~/.lilbox/templates/` **override** repo starters
+Resolution: user templates in `~/.local/share/lilbox/templates/` **override** repo starters
 in `templates/`. Precedence for values is **CLI flag > template > default**
 (`lilbox new --image alpine --template python-dev` boots alpine, keeping the
 template's other defaults). If a template has a `Dockerfile` (and no `image`),
 `lilbox new` builds it with Docker, imports it through `Image::load`, and caches it; `--rebuild`
 forces a fresh build. `setup.sh` runs post-boot; a non-zero exit is surfaced and
-logged to `~/.lilbox/logs/<box>-setup.log` (the box is kept for inspection).
+logged to `~/.local/state/lilbox/logs/<box>-setup.log` (the box is kept for inspection).
 
 Shipped starters: **`python-dev`** (python + git + uv) and **`node-dev`**
 (node + npm + git).
@@ -131,7 +147,7 @@ Shipped starters: **`python-dev`** (python + git + uv) and **`node-dev`**
 box gets its own URL and nothing collides with an existing root `serve`/Caddy
 setup. `--public` swaps `serve` for `funnel` (443/8443/10000 only) to reach the
 open internet. State (name → image → host port → serve port → URL) lives in
-`~/.lilbox/state.db`.
+`~/.local/state/lilbox/state.db`.
 
 ## Boxes with Tailscale baked in (`lilbox-box`)
 
@@ -172,7 +188,7 @@ removed from the tailnet immediately rather than waiting for it to age out.
 ### Joining the tailnet: OAuth-minted keys vs. a static auth key
 
 `lilbox new` can join a box to the tailnet two ways, configured under
-`[tailscale]` in `~/.lilbox/config.toml`:
+`[tailscale]` in `~/.config/lilbox/config.toml`:
 
 ```toml
 [tailscale]
@@ -260,7 +276,7 @@ data is preserved and a bare `lilbox rebuild NAME` retries.
 - **Idle suspend:** `lilbox new web --idle-timeout 20m` suspends the box after it's
   idle (frees RAM); `lilbox exec`/`lilbox ssh` **transparently resume** it (~1–2s). A box
   you `lilbox stop` yourself is never auto-resumed.
-- **Defaults & caps:** `~/.lilbox/config.toml` sets defaults for
+- **Defaults & caps:** `~/.config/lilbox/config.toml` sets defaults for
   `image`/`port`/`cpus`/`memory`/`ttl`/`idle_timeout` and caps
   (`max_cpus`/`max_memory`) that clamp an over-limit `lilbox new`. Precedence: CLI
   flag > template > config > built-in. See
@@ -287,7 +303,7 @@ and **never written into the box's image or state**. Override with
 
 ## Configuration
 
-`~/.lilbox/config.toml` sets `lilbox new` defaults using standard TOML. Precedence
+`~/.config/lilbox/config.toml` sets `lilbox new` defaults using standard TOML. Precedence
 is **CLI flag > template > config > built-in default**. See
 [`config.toml.example`](config.toml.example).
 
