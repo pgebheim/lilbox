@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use rusqlite::params;
 
 use crate::app::App;
-use crate::tailscale::{allocate_serve_port, tailnet_host};
+use crate::tailscale::{allocate_serve_port, box_display_url, tailnet_host};
 use crate::util::{run_external, successful_output};
 
 pub(crate) fn expose(app: &App, name: String, public: bool) -> Result<()> {
@@ -70,10 +70,10 @@ pub(crate) fn unexpose(app: &App, name: String) -> Result<()> {
 }
 
 pub(crate) fn url(app: &App, name: String) -> Result<()> {
+    let row = app.require_row(&name)?;
     println!(
         "{}",
-        app.require_row(&name)?
-            .url
+        box_display_url(row.tailscale_node.as_deref(), row.url.as_deref())
             .ok_or_else(|| anyhow!("'{name}' is not exposed (lilbox expose {name})"))?
     );
     Ok(())

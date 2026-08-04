@@ -98,6 +98,22 @@ pub(crate) fn serve_ports(ts: &Path) -> HashSet<u16> {
     ports
 }
 
+/// The box's own MagicDNS URL, e.g. `https://web.tail1234.ts.net/`.
+pub(crate) fn magicdns_url(node: &str) -> String {
+    format!("https://{node}/")
+}
+
+/// Preferred display URL for a box: MagicDNS if it's on the tailnet, else the
+/// expose/serve URL.
+pub(crate) fn box_display_url(
+    tailscale_node: Option<&str>,
+    expose_url: Option<&str>,
+) -> Option<String> {
+    tailscale_node
+        .map(magicdns_url)
+        .or_else(|| expose_url.map(String::from))
+}
+
 pub(crate) fn allocate_serve_port(app: &App, public: bool) -> Result<u16> {
     let ts = app
         .tailscale
@@ -216,6 +232,35 @@ mod tests {
         assert!(!is_valid_env_var_name("TS AUTHKEY"));
         assert!(!is_valid_env_var_name("TS-AUTHKEY"));
         assert!(!is_valid_env_var_name("TS_AUTHKEY\"; rm -rf /"));
+    }
+
+    #[test]
+    fn magicdns_url_formats_https() {
+        assert_eq!(
+            magicdns_url("web.tail1.ts.net"),
+            "https://web.tail1.ts.net/"
+        );
+    }
+
+    #[test]
+    fn box_display_url_prefers_magicdns() {
+        assert_eq!(
+            box_display_url(Some("web.tail1.ts.net"), Some("https://exposed/")),
+            Some("https://web.tail1.ts.net/".into())
+        );
+    }
+
+    #[test]
+    fn box_display_url_falls_back_to_expose() {
+        assert_eq!(
+            box_display_url(None, Some("https://exposed/")),
+            Some("https://exposed/".into())
+        );
+    }
+
+    #[test]
+    fn box_display_url_none_when_neither() {
+        assert_eq!(box_display_url(None, None), None);
     }
 
     #[test]
