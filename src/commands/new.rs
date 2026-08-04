@@ -135,7 +135,7 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
     )?;
     println!("box {name} is up ({image}, guest :{guest_port})");
     if joins_tailnet {
-        let argv = tailscale_up_command(&tag, &key_env, &name);
+        let argv = tailscale_up_command(&tag, &key_env, &name, guest_port);
         match sandbox.exec(argv[0].clone(), argv[1..].to_vec()).await {
             Ok(output) if output.status().success => {
                 if let Some(node) = output.stdout().ok().as_deref().and_then(node_hostname)

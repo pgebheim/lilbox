@@ -62,10 +62,20 @@ pub(crate) fn is_valid_env_var_name(name: &str) -> bool {
 
 /// Build the guest exec argv for joining the tailnet. References the key only
 /// via the env var name -- the literal key value never appears here.
-pub(crate) fn tailscale_up_command(tag: &str, key_env: &str, hostname: &str) -> Vec<String> {
+///
+/// After a successful `tailscale up`, best-effort `tailscale serve`s
+/// `guest_port` on 443 so the box's MagicDNS URL proxies to the app. Serve
+/// failures only warn to stderr -- they must not fail the join.
+pub(crate) fn tailscale_up_command(
+    tag: &str,
+    key_env: &str,
+    hostname: &str,
+    guest_port: u16,
+) -> Vec<String> {
     let script = format!(
         "command -v tailscaled >/dev/null 2>&1 || exit 3; /usr/local/bin/lilbox-boot || exit 4; \
 tailscale up --auth-key=\"${key_env}\" --advertise-tags=\"$1\" --ssh --hostname=\"$2\" || exit 5; \
+tailscale serve --bg \"$3\" || echo \"warning: tailscale serve failed\" >&2; \
 tailscale status --json"
     );
     vec![
@@ -75,6 +85,7 @@ tailscale status --json"
         "sh".into(),
         tag.into(),
         hostname.into(),
+        guest_port.to_string(),
     ]
 }
 
@@ -216,13 +227,41 @@ mod tests {
 
     #[test]
     fn builds_tailscale_up_argv() {
-        let argv = tailscale_up_command("tag:lilbox-vm", "TS_AUTHKEY", "mybox");
+        let argv = tailscale_up_command("tag:lilbox-vm", "TS_AUTHKEY", "mybox", 8080);
         let joined = argv.join(" ");
         assert!(joined.contains("--advertise-tags="));
         assert!(joined.contains("tag:lilbox-vm"));
         assert!(joined.contains("--ssh"));
         assert!(joined.contains("$TS_AUTHKEY"));
         assert!(!joined.contains("tskey-auth"));
+        assert!(joined.contains("tailscale serve --bg"));
+        assert!(joined.contains("\"$3\""));
+
+        let script = &argv[2];
+        let up_pos = script.find("tailscale up").expect("tailscale up present");
+        let up_fail_pos = script[up_pos..].find("|| exit 5").expect("up hard-fails");
+        let serve_pos = script
+            .find("tailscale serve")
+            .expect("tailscale serve present");
+        assert!(
+            up_pos + up_fail_pos < serve_pos,
+            "up must hard-fail before serve runs"
+        );
+        let serve_tail = &script[serve_pos..];
+        let serve_fallback_end = serve_tail.find(">&2;").expect("serve warns and continues");
+        assert!(
+            !serve_tail[..serve_fallback_end].contains("exit"),
+            "serve step must be best-effort (no exit)"
+        );
+
+        assert_eq!(
+            &argv[argv.len() - 3..],
+            &[
+                "tag:lilbox-vm".to_string(),
+                "mybox".to_string(),
+                "8080".to_string()
+            ]
+        );
     }
 
     #[test]
