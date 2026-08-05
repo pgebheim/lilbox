@@ -340,6 +340,25 @@ the SDK's `secret_env` API — sent only to `api.anthropic.com`
 and **never written into the box's image or state**. Override with
 `--key-env`/`--key-host`.
 
+## Use it from herdr
+
+[herdr](https://herdr.dev) is an agent multiplexer — persistent workspaces,
+panes, and automatic agent state detection. It runs agents but doesn't isolate
+them; lilbox isolates but has no multiplexer.
+[`contrib/herdr/`](contrib/herdr/) is the seam: a herdr plugin that gives every
+worktree its own microVM and destroys it with the worktree.
+
+```bash
+herdr plugin install pgebheim/lilbox/contrib/herdr   # on the lilbox host
+herdr plugin action invoke lilbox.agent    # boot this worktree's box, run the agent in it
+```
+
+Every other sandbox-backed herdr plugin delegates isolation to someone else's
+cloud. This one runs on your hardware and bind-mounts the live worktree instead
+of shuttling snapshots. Install it on the **lilbox host**, not a `herdr --remote`
+or Herdr Mirror client — see
+[`contrib/herdr/README.md`](contrib/herdr/README.md) for the topology and config.
+
 ## Configuration
 
 `~/.config/lilbox/config.toml` sets `lilbox new` defaults using standard TOML. Precedence
