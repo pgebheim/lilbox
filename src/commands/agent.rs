@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::app::App;
 use crate::cli::AgentArgs;
-use crate::sandbox::{run_guest, with_secret_env};
+use crate::sandbox::{run_guest, stop_and_remove, with_secret_env};
 use crate::util::{DEFAULT_GUEST_PORT, alloc_host_port, find_program, random_name};
 
 const AGENT_WORKDIR: &str = "/workspace";
@@ -58,6 +58,44 @@ fn decide_auth_mode(creds_exist: bool, no_claude_config: bool, api_key_set: bool
 fn host_claude_paths(home: Option<PathBuf>) -> Result<(PathBuf, PathBuf)> {
     let home = home.ok_or_else(|| anyhow!("could not determine home directory"))?;
     Ok((home.join(".claude"), home.join(".claude.json")))
+}
+
+/// Why post-`create_detached` provisioning is considered failed. `None` = success.
+#[derive(Debug, PartialEq, Eq)]
+enum ProvisionFailure {
+    InstallFailed,
+    ClaudeAbsent,
+}
+
+/// Classify the install shell's exit and the follow-up `command -v claude` probe.
+/// An install that exits non-zero is InstallFailed regardless of the probe (its
+/// symlink step is `||`-guarded, so exit 0 doesn't prove claude is on PATH — and
+/// a non-zero exit means the install itself broke).
+fn classify_install_probe(install_ok: bool, probe_ok: bool) -> Option<ProvisionFailure> {
+    if !install_ok {
+        Some(ProvisionFailure::InstallFailed)
+    } else if !probe_ok {
+        Some(ProvisionFailure::ClaudeAbsent)
+    } else {
+        None
+    }
+}
+
+/// Run `result`; if it's `Err`, run `cleanup` exactly once (best-effort — a
+/// cleanup failure is swallowed, the ORIGINAL error is returned). On `Ok`,
+/// `cleanup` never runs. Returns the original result.
+async fn or_cleanup<T, C, Fut>(result: anyhow::Result<T>, cleanup: C) -> anyhow::Result<T>
+where
+    C: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    match result {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let _ = cleanup().await;
+            Err(e)
+        }
+    }
 }
 
 /// Best-effort chmod inside the box. Tightening perms on inherited credentials
@@ -149,76 +187,100 @@ pub(crate) async fn cmd_agent(app: &App, args: AgentArgs) -> Result<i32> {
         workspace.display()
     );
     let sandbox = builder.create_detached().await?;
-    app.db.execute("INSERT INTO boxes(name,image,guest_port,host_port,created,comment) VALUES(?1,?2,?3,?4,?5,'agent')",
-        params![name, args.image, DEFAULT_GUEST_PORT, host_port, Local::now().format("%Y-%m-%d %H:%M:%S").to_string()])?;
-    if let Some(source) = args.agents_file {
-        let target = workspace.join("AGENTS.md");
-        if source.canonicalize()? != target.canonicalize().unwrap_or_else(|_| target.clone()) {
-            fs::copy(source, target)?;
-        }
-    }
-    let install = "command -v claude >/dev/null 2>&1 || { command -v curl >/dev/null 2>&1 || ((apt-get update -qq && apt-get install -y -qq curl) 2>/dev/null || apk add --no-cache curl); curl -fsSL https://claude.ai/install.sh | bash; [ ! -x \"$HOME/.local/bin/claude\" ] || ln -sf \"$HOME/.local/bin/claude\" /usr/local/bin/claude; }";
-    let output = sandbox.shell(install).await?;
-    if !output.status().success {
-        eprintln!(
-            "warning: agent install failed: {}",
-            output.stderr().unwrap_or_default()
-        );
-    }
-    println!("agent box {name} ready (workspace mounted at {AGENT_WORKDIR})");
-    if mode == AuthMode::InheritLogin {
-        let (claude_dir, claude_json) = claude_paths.as_ref().unwrap();
-        let credentials_path = creds_src.as_ref().unwrap();
-        let guest_claude_dir = "/root/.claude";
-        let guest_credentials = "/root/.claude/.credentials.json";
-        if let Err(err) = sandbox.fs().mkdir(guest_claude_dir).await
-            && !sandbox.fs().exists(guest_claude_dir).await.unwrap_or(false)
-        {
-            bail!("could not create {guest_claude_dir} in agent box: {err}");
-        }
-        sandbox
-            .fs()
-            .copy_from_host(credentials_path, guest_credentials)
-            .await
-            .with_context(|| {
-                format!(
-                    "could not copy {} into agent box",
-                    credentials_path.display()
-                )
-            })?;
-        chmod_guest(&sandbox, guest_credentials, 0o600).await;
-        chmod_guest(&sandbox, guest_claude_dir, 0o700).await;
-        let settings_path = claude_dir.join("settings.json");
-        if settings_path.exists() {
-            sandbox
-                .fs()
-                .copy_from_host(&settings_path, "/root/.claude/settings.json")
-                .await
-                .with_context(|| {
-                    format!("could not copy {} into agent box", settings_path.display())
-                })?;
-        }
-        let slice = fs::read_to_string(claude_json)
-            .map_err(anyhow::Error::from)
-            .and_then(|raw| claude_auth_slice(&raw));
-        match slice {
-            Ok(slice) => {
-                let serialized = serde_json::to_vec(&slice)?;
-                sandbox
-                    .fs()
-                    .write("/root/.claude.json", serialized)
-                    .await
-                    .with_context(|| "could not write /root/.claude.json into agent box")?;
-                chmod_guest(&sandbox, "/root/.claude.json", 0o600).await;
+    let provision = async {
+        if let Some(source) = &args.agents_file {
+            let target = workspace.join("AGENTS.md");
+            if source.canonicalize()? != target.canonicalize().unwrap_or_else(|_| target.clone()) {
+                fs::copy(source, target)?;
             }
-            Err(_) => {
-                eprintln!(
-                    "warning: account identity/onboarding not inherited (could not read or parse {})",
-                    claude_json.display()
+        }
+        let install = "command -v claude >/dev/null 2>&1 || { command -v curl >/dev/null 2>&1 || ((apt-get update -qq && apt-get install -y -qq curl) 2>/dev/null || apk add --no-cache curl); curl -fsSL https://claude.ai/install.sh | bash; [ ! -x \"$HOME/.local/bin/claude\" ] || ln -sf \"$HOME/.local/bin/claude\" /usr/local/bin/claude; }";
+        let output = sandbox.shell(install).await?;
+        let install_ok = output.status().success;
+        let probe = sandbox.shell("command -v claude >/dev/null 2>&1").await?;
+        let probe_ok = probe.status().success;
+        match classify_install_probe(install_ok, probe_ok) {
+            Some(ProvisionFailure::InstallFailed) => {
+                bail!(
+                    "claude install failed: {}",
+                    output.stderr().unwrap_or_default()
                 );
             }
+            Some(ProvisionFailure::ClaudeAbsent) => {
+                bail!("claude is not on PATH in the box after install");
+            }
+            None => {}
         }
-    }
+        if mode == AuthMode::InheritLogin {
+            let (claude_dir, claude_json) = claude_paths.as_ref().unwrap();
+            let credentials_path = creds_src.as_ref().unwrap();
+            let guest_claude_dir = "/root/.claude";
+            let guest_credentials = "/root/.claude/.credentials.json";
+            if let Err(err) = sandbox.fs().mkdir(guest_claude_dir).await
+                && !sandbox.fs().exists(guest_claude_dir).await.unwrap_or(false)
+            {
+                bail!("could not create {guest_claude_dir} in agent box: {err}");
+            }
+            sandbox
+                .fs()
+                .copy_from_host(credentials_path, guest_credentials)
+                .await
+                .with_context(|| {
+                    format!(
+                        "could not copy {} into agent box",
+                        credentials_path.display()
+                    )
+                })?;
+            chmod_guest(&sandbox, guest_credentials, 0o600).await;
+            chmod_guest(&sandbox, guest_claude_dir, 0o700).await;
+            let settings_path = claude_dir.join("settings.json");
+            if settings_path.exists() {
+                sandbox
+                    .fs()
+                    .copy_from_host(&settings_path, "/root/.claude/settings.json")
+                    .await
+                    .with_context(|| {
+                        format!("could not copy {} into agent box", settings_path.display())
+                    })?;
+            }
+            let slice = fs::read_to_string(claude_json)
+                .map_err(anyhow::Error::from)
+                .and_then(|raw| claude_auth_slice(&raw));
+            match slice {
+                Ok(slice) => {
+                    let serialized = serde_json::to_vec(&slice)?;
+                    sandbox
+                        .fs()
+                        .write("/root/.claude.json", serialized)
+                        .await
+                        .with_context(|| "could not write /root/.claude.json into agent box")?;
+                    chmod_guest(&sandbox, "/root/.claude.json", 0o600).await;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "warning: account identity/onboarding not inherited (could not read or parse {})",
+                        claude_json.display()
+                    );
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::pin!(provision);
+    let outcome = tokio::select! {
+        r = &mut provision => r,
+        _ = tokio::signal::ctrl_c() => Err(anyhow!("interrupted before the box finished provisioning")),
+    };
+    or_cleanup(outcome, || stop_and_remove(&name)).await?;
+    // Commit point. Guard the row write too: if it fails (e.g. SQLITE_BUSY, or a
+    // duplicate name that appeared in the widened window since the existence
+    // check), the VM is already built, so tear it down rather than orphan it.
+    let insert = app.db.execute("INSERT INTO boxes(name,image,guest_port,host_port,created,comment) VALUES(?1,?2,?3,?4,?5,'agent')",
+        params![name, args.image, DEFAULT_GUEST_PORT, host_port, Local::now().format("%Y-%m-%d %H:%M:%S").to_string()])
+        .map(|_| ())
+        .map_err(anyhow::Error::from);
+    or_cleanup(insert, || stop_and_remove(&name)).await?;
+    println!("agent box {name} ready (workspace mounted at {AGENT_WORKDIR})");
     if args.task.is_empty() {
         return Ok(0);
     }
@@ -399,5 +461,85 @@ mod tests {
     #[test]
     fn host_claude_paths_errs_when_home_is_none() {
         assert!(host_claude_paths(None).is_err());
+    }
+
+    #[test]
+    fn classify_install_probe_none_when_install_and_probe_ok() {
+        assert_eq!(classify_install_probe(true, true), None);
+    }
+
+    #[test]
+    fn classify_install_probe_claude_absent_when_install_ok_but_probe_fails() {
+        assert_eq!(
+            classify_install_probe(true, false),
+            Some(ProvisionFailure::ClaudeAbsent)
+        );
+    }
+
+    #[test]
+    fn classify_install_probe_install_failed_when_install_fails_and_probe_ok() {
+        assert_eq!(
+            classify_install_probe(false, true),
+            Some(ProvisionFailure::InstallFailed)
+        );
+    }
+
+    #[test]
+    fn classify_install_probe_install_failed_when_both_fail() {
+        assert_eq!(
+            classify_install_probe(false, false),
+            Some(ProvisionFailure::InstallFailed)
+        );
+    }
+
+    #[tokio::test]
+    async fn or_cleanup_ok_result_does_not_run_cleanup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let result: anyhow::Result<i32> = Ok(42);
+
+        let outcome = or_cleanup(result, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert_eq!(outcome.unwrap(), 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn or_cleanup_err_result_runs_cleanup_once_and_returns_original_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let result: anyhow::Result<i32> = Err(anyhow!("original failure"));
+
+        let outcome = or_cleanup(result, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert_eq!(outcome.unwrap_err().to_string(), "original failure");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn or_cleanup_err_result_swallows_cleanup_error_and_returns_original_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let result: anyhow::Result<i32> = Err(anyhow!("original failure"));
+
+        let outcome = or_cleanup(result, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow!("cleanup failure"))
+        })
+        .await;
+
+        assert_eq!(outcome.unwrap_err().to_string(), "original failure");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
