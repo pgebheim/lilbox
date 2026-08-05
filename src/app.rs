@@ -231,135 +231,158 @@ mod tests {
 
     use super::*;
 
-    fn test_app() -> App {
-        let db = Connection::open_in_memory().unwrap();
-        migrate(&db).unwrap();
-        App {
-            config_dir: PathBuf::new(),
-            data_dir: PathBuf::new(),
-            state_dir: PathBuf::new(),
-            db,
-            tailscale: None,
+    /// The `boxes.tailscale_node` column: written on join, read back by both
+    /// the single-row and list queries, and absent for a box that never joined.
+    mod tailscale_node {
+        use super::*;
+
+        fn test_app() -> App {
+            let db = Connection::open_in_memory().unwrap();
+            migrate(&db).unwrap();
+            App {
+                config_dir: PathBuf::new(),
+                data_dir: PathBuf::new(),
+                state_dir: PathBuf::new(),
+                db,
+                tailscale: None,
+            }
+        }
+
+        #[test]
+        fn round_trips() {
+            let app = test_app();
+            app.db
+                .execute(
+                    "INSERT INTO boxes(name,image,created) VALUES(?1,?2,?3)",
+                    params!["box1", "python", "2024-01-01"],
+                )
+                .unwrap();
+            app.db
+                .execute(
+                    "UPDATE boxes SET tailscale_node=?1 WHERE name=?2",
+                    params!["box1.tail1234.ts.net", "box1"],
+                )
+                .unwrap();
+            let row = app.row("box1").unwrap().unwrap();
+            assert_eq!(row.tailscale_node.as_deref(), Some("box1.tail1234.ts.net"));
+        }
+
+        /// A box that never joined a tailnet has no node name.
+        #[test]
+        fn defaults_to_none() {
+            let app = test_app();
+            app.db
+                .execute(
+                    "INSERT INTO boxes(name,image,created) VALUES(?1,?2,?3)",
+                    params!["box2", "python", "2024-01-01"],
+                )
+                .unwrap();
+            let row = app.row("box2").unwrap().unwrap();
+            assert!(row.tailscale_node.is_none());
+        }
+
+        /// `rows()` selects the column too, not just `row()`.
+        #[test]
+        fn appears_in_rows() {
+            let app = test_app();
+            app.db
+                .execute(
+                    "INSERT INTO boxes(name,image,created,tailscale_node) VALUES(?1,?2,?3,?4)",
+                    params!["box3", "python", "2024-01-01", "box3.tail1234.ts.net"],
+                )
+                .unwrap();
+            let rows = app.rows().unwrap();
+            assert_eq!(
+                rows[0].tailscale_node.as_deref(),
+                Some("box3.tail1234.ts.net")
+            );
         }
     }
 
-    #[test]
-    fn records_and_reads_back_tailscale_node() {
-        let app = test_app();
-        app.db
-            .execute(
-                "INSERT INTO boxes(name,image,created) VALUES(?1,?2,?3)",
-                params!["box1", "python", "2024-01-01"],
-            )
-            .unwrap();
-        app.db
-            .execute(
-                "UPDATE boxes SET tailscale_node=?1 WHERE name=?2",
-                params!["box1.tail1234.ts.net", "box1"],
-            )
-            .unwrap();
-        let row = app.row("box1").unwrap().unwrap();
-        assert_eq!(row.tailscale_node.as_deref(), Some("box1.tail1234.ts.net"));
+    mod resolve_dir {
+        use super::*;
+
+        /// An XDG base dir is used as-is, with `lilbox` appended.
+        #[test]
+        fn uses_xdg_when_present() {
+            let resolved = resolve_dir(Some(PathBuf::from("/xdg/config")), "config").unwrap();
+            assert_eq!(resolved, PathBuf::from("/xdg/config/lilbox"));
+        }
     }
 
-    #[test]
-    fn tailscale_node_defaults_to_none() {
-        let app = test_app();
-        app.db
-            .execute(
-                "INSERT INTO boxes(name,image,created) VALUES(?1,?2,?3)",
-                params!["box2", "python", "2024-01-01"],
-            )
-            .unwrap();
-        let row = app.row("box2").unwrap().unwrap();
-        assert!(row.tailscale_node.is_none());
-    }
+    mod migrate_legacy_dir {
+        use super::*;
 
-    fn temp_dir(label: &str) -> PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "lilbox-app-test-{label}-{}-{nonce}",
-            std::process::id()
-        ))
-    }
+        fn temp_dir(label: &str) -> PathBuf {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            std::env::temp_dir().join(format!(
+                "lilbox-app-test-{label}-{}-{nonce}",
+                std::process::id()
+            ))
+        }
 
-    #[test]
-    fn resolve_dir_uses_xdg_dir_when_present() {
-        let resolved = resolve_dir(Some(PathBuf::from("/xdg/config")), "config").unwrap();
-        assert_eq!(resolved, PathBuf::from("/xdg/config/lilbox"));
-    }
+        /// Each piece of the old single-directory layout lands in its XDG home:
+        /// config with config, the state DB and logs with state, templates and
+        /// workspaces with data -- and the legacy copies are gone afterwards.
+        #[test]
+        fn moves_pieces() {
+            let root = temp_dir("migrate");
+            let legacy = root.join("legacy");
+            let config_dir = root.join("config");
+            let data_dir = root.join("data");
+            let state_dir = root.join("state");
+            fs::create_dir_all(legacy.join("logs")).unwrap();
+            fs::create_dir_all(legacy.join("templates").join("my-template")).unwrap();
+            fs::create_dir_all(legacy.join("workspaces")).unwrap();
+            fs::write(legacy.join("config.toml"), "image = \"alpine\"").unwrap();
+            fs::write(legacy.join("state.db"), b"fake-db").unwrap();
+            fs::write(legacy.join("logs").join("box-setup.log"), "log").unwrap();
+            fs::create_dir_all(&config_dir).unwrap();
+            fs::create_dir_all(&data_dir).unwrap();
+            fs::create_dir_all(&state_dir).unwrap();
 
-    #[test]
-    fn migrate_legacy_dir_moves_pieces_to_new_homes() {
-        let root = temp_dir("migrate");
-        let legacy = root.join("legacy");
-        let config_dir = root.join("config");
-        let data_dir = root.join("data");
-        let state_dir = root.join("state");
-        fs::create_dir_all(legacy.join("logs")).unwrap();
-        fs::create_dir_all(legacy.join("templates").join("my-template")).unwrap();
-        fs::create_dir_all(legacy.join("workspaces")).unwrap();
-        fs::write(legacy.join("config.toml"), "image = \"alpine\"").unwrap();
-        fs::write(legacy.join("state.db"), b"fake-db").unwrap();
-        fs::write(legacy.join("logs").join("box-setup.log"), "log").unwrap();
-        fs::create_dir_all(&config_dir).unwrap();
-        fs::create_dir_all(&data_dir).unwrap();
-        fs::create_dir_all(&state_dir).unwrap();
+            migrate_legacy_dir(&legacy, &config_dir, &data_dir, &state_dir);
 
-        migrate_legacy_dir(&legacy, &config_dir, &data_dir, &state_dir);
+            assert!(config_dir.join("config.toml").is_file());
+            assert!(state_dir.join("state.db").is_file());
+            assert!(state_dir.join("logs").join("box-setup.log").is_file());
+            assert!(data_dir.join("templates").join("my-template").is_dir());
+            assert!(data_dir.join("workspaces").is_dir());
+            assert!(!legacy.join("config.toml").exists());
+            assert!(!legacy.join("state.db").exists());
 
-        assert!(config_dir.join("config.toml").is_file());
-        assert!(state_dir.join("state.db").is_file());
-        assert!(state_dir.join("logs").join("box-setup.log").is_file());
-        assert!(data_dir.join("templates").join("my-template").is_dir());
-        assert!(data_dir.join("workspaces").is_dir());
-        assert!(!legacy.join("config.toml").exists());
-        assert!(!legacy.join("state.db").exists());
+            fs::remove_dir_all(&root).unwrap();
+        }
 
-        fs::remove_dir_all(&root).unwrap();
-    }
+        /// Migration is once-only: an existing state DB in the new home means
+        /// this already ran, so leave both sides untouched rather than
+        /// overwriting migrated state with the legacy copy.
+        #[test]
+        fn skips_when_db_exists() {
+            let root = temp_dir("migrate-skip");
+            let legacy = root.join("legacy");
+            let config_dir = root.join("config");
+            let data_dir = root.join("data");
+            let state_dir = root.join("state");
+            fs::create_dir_all(&legacy).unwrap();
+            fs::write(legacy.join("state.db"), b"legacy-db").unwrap();
+            fs::create_dir_all(&config_dir).unwrap();
+            fs::create_dir_all(&data_dir).unwrap();
+            fs::create_dir_all(&state_dir).unwrap();
+            fs::write(state_dir.join("state.db"), b"already-migrated").unwrap();
 
-    #[test]
-    fn migrate_legacy_dir_skips_when_state_db_already_exists() {
-        let root = temp_dir("migrate-skip");
-        let legacy = root.join("legacy");
-        let config_dir = root.join("config");
-        let data_dir = root.join("data");
-        let state_dir = root.join("state");
-        fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join("state.db"), b"legacy-db").unwrap();
-        fs::create_dir_all(&config_dir).unwrap();
-        fs::create_dir_all(&data_dir).unwrap();
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(state_dir.join("state.db"), b"already-migrated").unwrap();
+            migrate_legacy_dir(&legacy, &config_dir, &data_dir, &state_dir);
 
-        migrate_legacy_dir(&legacy, &config_dir, &data_dir, &state_dir);
+            assert!(legacy.join("state.db").is_file());
+            assert_eq!(
+                fs::read(state_dir.join("state.db")).unwrap(),
+                b"already-migrated"
+            );
 
-        assert!(legacy.join("state.db").is_file());
-        assert_eq!(
-            fs::read(state_dir.join("state.db")).unwrap(),
-            b"already-migrated"
-        );
-
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn rows_lists_tailscale_node() {
-        let app = test_app();
-        app.db
-            .execute(
-                "INSERT INTO boxes(name,image,created,tailscale_node) VALUES(?1,?2,?3,?4)",
-                params!["box3", "python", "2024-01-01", "box3.tail1234.ts.net"],
-            )
-            .unwrap();
-        let rows = app.rows().unwrap();
-        assert_eq!(
-            rows[0].tailscale_node.as_deref(),
-            Some("box3.tail1234.ts.net")
-        );
+            fs::remove_dir_all(&root).unwrap();
+        }
     }
 }

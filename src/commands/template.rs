@@ -173,141 +173,174 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn detects_git_sources() {
-        assert!(is_git_source("https://github.com/foo/bar"));
-        assert!(is_git_source("http://example.com/repo.git"));
-        assert!(is_git_source("git@github.com:foo/bar.git"));
-        assert!(is_git_source("ssh://git@example.com/foo/bar"));
-        assert!(is_git_source("/some/local/path.git"));
+    mod is_git_source {
+        use super::*;
+
+        /// Every shape of git remote we accept: https, http, scp-style ssh,
+        /// ssh://, and a local path carrying the `.git` suffix.
+        #[test]
+        fn detects_git() {
+            assert!(is_git_source("https://github.com/foo/bar"));
+            assert!(is_git_source("http://example.com/repo.git"));
+            assert!(is_git_source("git@github.com:foo/bar.git"));
+            assert!(is_git_source("ssh://git@example.com/foo/bar"));
+            assert!(is_git_source("/some/local/path.git"));
+        }
+
+        /// A plain path or bare name is a local source, not something to clone.
+        #[test]
+        fn rejects_non_git() {
+            assert!(!is_git_source("/some/local/path"));
+            assert!(!is_git_source("./relative/dir"));
+            assert!(!is_git_source("plain-name"));
+        }
     }
 
-    #[test]
-    fn rejects_non_git_sources() {
-        assert!(!is_git_source("/some/local/path"));
-        assert!(!is_git_source("./relative/dir"));
-        assert!(!is_git_source("plain-name"));
+    mod derive_template_name {
+        use super::*;
+
+        /// The repo name, with the `.git` suffix dropped.
+        #[test]
+        fn derives_from_git_url() {
+            assert_eq!(
+                derive_template_name("https://github.com/foo/my-template.git", None),
+                "my-template"
+            );
+        }
+
+        /// The last path segment, with or without a trailing slash.
+        #[test]
+        fn derives_from_local_path() {
+            assert_eq!(derive_template_name("/tmp/some/dir", None), "dir");
+            assert_eq!(derive_template_name("/tmp/some/dir/", None), "dir");
+        }
+
+        /// An explicitly supplied name skips derivation entirely.
+        #[test]
+        fn explicit_wins() {
+            assert_eq!(
+                derive_template_name("https://github.com/foo/bar.git", Some("custom")),
+                "custom"
+            );
+        }
     }
 
-    #[test]
-    fn derives_name_from_git_url() {
-        assert_eq!(
-            derive_template_name("https://github.com/foo/my-template.git", None),
-            "my-template"
-        );
+    mod copy_dir_recursive {
+        use super::*;
+
+        /// Nested files come across, not just the top level.
+        #[test]
+        fn copies_nested_tree() {
+            let source = temp_dir("source");
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("template.json"), "{}").unwrap();
+            fs::create_dir_all(source.join("nested")).unwrap();
+            fs::write(source.join("nested").join("setup.sh"), "echo hi").unwrap();
+
+            let templates_root = temp_dir("templates");
+            let dest = templates_root.join("my-template");
+
+            copy_dir_recursive(&source, &dest).unwrap();
+            assert!(dest.join("template.json").is_file());
+            assert!(dest.join("nested").join("setup.sh").is_file());
+
+            fs::remove_dir_all(&dest).unwrap();
+            assert!(!dest.exists());
+
+            let _ = fs::remove_dir_all(&source);
+            let _ = fs::remove_dir_all(&templates_root);
+        }
     }
 
-    #[test]
-    fn derives_name_from_local_path() {
-        assert_eq!(derive_template_name("/tmp/some/dir", None), "dir");
-        assert_eq!(derive_template_name("/tmp/some/dir/", None), "dir");
+    mod install_local {
+        use super::*;
+
+        fn make_valid_template_source(label: &str) -> PathBuf {
+            let source = temp_dir(label);
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("template.json"), "{}").unwrap();
+            source
+        }
+
+        /// Installing over an existing template needs `--force`; without it the
+        /// error says so rather than silently replacing the user's copy.
+        #[test]
+        fn refuses_existing() {
+            let source = make_valid_template_source("il-source-1");
+            let templates_root = temp_dir("il-templates-1");
+            fs::create_dir_all(templates_root.join("my-template")).unwrap();
+
+            let err = install_local(&templates_root, &source, "my-template", false).unwrap_err();
+            assert!(err.to_string().contains("already exists"));
+
+            let _ = fs::remove_dir_all(&source);
+            let _ = fs::remove_dir_all(&templates_root);
+        }
+
+        /// `--force` replaces rather than merges: stale files from the previous
+        /// install must not survive.
+        #[test]
+        fn overwrites_with_force() {
+            let source = make_valid_template_source("il-source-2");
+            let templates_root = temp_dir("il-templates-2");
+            let dest = templates_root.join("my-template");
+            fs::create_dir_all(&dest).unwrap();
+            fs::write(dest.join("stale.txt"), "old").unwrap();
+
+            install_local(&templates_root, &source, "my-template", true).unwrap();
+            assert!(dest.join("template.json").is_file());
+            assert!(!dest.join("stale.txt").exists());
+
+            let _ = fs::remove_dir_all(&source);
+            let _ = fs::remove_dir_all(&templates_root);
+        }
+
+        /// A source without `template.json` isn't a template. The failure must
+        /// leave nothing behind at the destination.
+        #[test]
+        fn cleans_up_on_error() {
+            let source = temp_dir("il-source-3");
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("not-a-template.txt"), "hi").unwrap();
+            let templates_root = temp_dir("il-templates-3");
+
+            let err = install_local(&templates_root, &source, "my-template", false).unwrap_err();
+            assert!(err.to_string().contains("template.json"));
+            assert!(!templates_root.join("my-template").exists());
+
+            let _ = fs::remove_dir_all(&source);
+            let _ = fs::remove_dir_all(&templates_root);
+        }
+
+        #[test]
+        fn copies_template() {
+            let source = make_valid_template_source("il-source-4");
+            fs::create_dir_all(source.join("nested")).unwrap();
+            fs::write(source.join("nested").join("setup.sh"), "echo hi").unwrap();
+            let templates_root = temp_dir("il-templates-4");
+
+            install_local(&templates_root, &source, "my-template", false).unwrap();
+            let dest = templates_root.join("my-template");
+            assert!(dest.join("template.json").is_file());
+            assert!(dest.join("nested").join("setup.sh").is_file());
+
+            let _ = fs::remove_dir_all(&source);
+            let _ = fs::remove_dir_all(&templates_root);
+        }
     }
 
-    #[test]
-    fn explicit_name_overrides_derivation() {
-        assert_eq!(
-            derive_template_name("https://github.com/foo/bar.git", Some("custom")),
-            "custom"
-        );
-    }
+    mod remove_local {
+        use super::*;
 
-    #[test]
-    fn local_copy_round_trips() {
-        let source = temp_dir("source");
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("template.json"), "{}").unwrap();
-        fs::create_dir_all(source.join("nested")).unwrap();
-        fs::write(source.join("nested").join("setup.sh"), "echo hi").unwrap();
+        #[test]
+        fn errors_when_missing() {
+            let templates_root = temp_dir("rl-templates-1");
+            fs::create_dir_all(&templates_root).unwrap();
 
-        let templates_root = temp_dir("templates");
-        let dest = templates_root.join("my-template");
+            let err = remove_local(&templates_root, "does-not-exist").unwrap_err();
+            assert!(err.to_string().contains("no user template named"));
 
-        copy_dir_recursive(&source, &dest).unwrap();
-        assert!(dest.join("template.json").is_file());
-        assert!(dest.join("nested").join("setup.sh").is_file());
-
-        fs::remove_dir_all(&dest).unwrap();
-        assert!(!dest.exists());
-
-        let _ = fs::remove_dir_all(&source);
-        let _ = fs::remove_dir_all(&templates_root);
-    }
-
-    fn make_valid_template_source(label: &str) -> PathBuf {
-        let source = temp_dir(label);
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("template.json"), "{}").unwrap();
-        source
-    }
-
-    #[test]
-    fn install_local_refuses_existing_without_force() {
-        let source = make_valid_template_source("il-source-1");
-        let templates_root = temp_dir("il-templates-1");
-        fs::create_dir_all(templates_root.join("my-template")).unwrap();
-
-        let err = install_local(&templates_root, &source, "my-template", false).unwrap_err();
-        assert!(err.to_string().contains("already exists"));
-
-        let _ = fs::remove_dir_all(&source);
-        let _ = fs::remove_dir_all(&templates_root);
-    }
-
-    #[test]
-    fn install_local_overwrites_with_force() {
-        let source = make_valid_template_source("il-source-2");
-        let templates_root = temp_dir("il-templates-2");
-        let dest = templates_root.join("my-template");
-        fs::create_dir_all(&dest).unwrap();
-        fs::write(dest.join("stale.txt"), "old").unwrap();
-
-        install_local(&templates_root, &source, "my-template", true).unwrap();
-        assert!(dest.join("template.json").is_file());
-        assert!(!dest.join("stale.txt").exists());
-
-        let _ = fs::remove_dir_all(&source);
-        let _ = fs::remove_dir_all(&templates_root);
-    }
-
-    #[test]
-    fn install_local_missing_template_json_errors_and_cleans_up() {
-        let source = temp_dir("il-source-3");
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("not-a-template.txt"), "hi").unwrap();
-        let templates_root = temp_dir("il-templates-3");
-
-        let err = install_local(&templates_root, &source, "my-template", false).unwrap_err();
-        assert!(err.to_string().contains("template.json"));
-        assert!(!templates_root.join("my-template").exists());
-
-        let _ = fs::remove_dir_all(&source);
-        let _ = fs::remove_dir_all(&templates_root);
-    }
-
-    #[test]
-    fn install_local_copies_valid_template() {
-        let source = make_valid_template_source("il-source-4");
-        fs::create_dir_all(source.join("nested")).unwrap();
-        fs::write(source.join("nested").join("setup.sh"), "echo hi").unwrap();
-        let templates_root = temp_dir("il-templates-4");
-
-        install_local(&templates_root, &source, "my-template", false).unwrap();
-        let dest = templates_root.join("my-template");
-        assert!(dest.join("template.json").is_file());
-        assert!(dest.join("nested").join("setup.sh").is_file());
-
-        let _ = fs::remove_dir_all(&source);
-        let _ = fs::remove_dir_all(&templates_root);
-    }
-
-    #[test]
-    fn remove_local_errors_on_missing_template() {
-        let templates_root = temp_dir("rl-templates-1");
-        fs::create_dir_all(&templates_root).unwrap();
-
-        let err = remove_local(&templates_root, "does-not-exist").unwrap_err();
-        assert!(err.to_string().contains("no user template named"));
-
-        let _ = fs::remove_dir_all(&templates_root);
+            let _ = fs::remove_dir_all(&templates_root);
+        }
     }
 }

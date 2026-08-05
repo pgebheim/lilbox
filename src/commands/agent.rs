@@ -107,8 +107,11 @@ pub(crate) async fn cmd_agent(app: &App, args: AgentArgs) -> Result<i32> {
 mod tests {
     use super::*;
 
+    /// The API key must reach the guest as an env-var *reference*, never as a
+    /// literal in the serialized sandbox config -- the config is persisted, so
+    /// an inlined secret would be written to disk.
     #[tokio::test]
-    async fn agent_secret_is_stored_as_an_environment_reference() {
+    async fn stores_secret_by_reference() {
         let config = with_secret_env(
             Sandbox::builder("agent-secret-test").image("python"),
             "ANTHROPIC_API_KEY",
