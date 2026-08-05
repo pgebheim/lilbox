@@ -99,26 +99,51 @@ fn shim_subcommand(argv: &[String]) -> Option<String> {
 
 /// Plugin-dir-relative paths to any bundled executable an entrypoint runs, for
 /// either command form. A direct `bin/…` token, or a `$HERDR_PLUGIN_ROOT/…`
-/// target inside a launcher string. Programs on PATH (`herdr`, `sh`) yield
-/// nothing — they aren't files we ship.
+/// target inside a launcher string (both `$VAR/` and `${VAR}/` are matched).
+/// Programs on PATH (`herdr`, `sh`) yield nothing — they aren't files we ship.
 fn plugin_relative_targets(argv: &[String]) -> Vec<String> {
-    const ROOT: &str = "$HERDR_PLUGIN_ROOT/";
+    const ROOT: &str = "HERDR_PLUGIN_ROOT";
     let mut out = Vec::new();
     for a in argv {
         if a.starts_with("bin/") {
             out.push(a.clone());
         }
         if let Some(idx) = a.find(ROOT) {
-            let rel: String = a[idx + ROOT.len()..]
-                .chars()
-                .take_while(|c| !c.is_whitespace() && *c != '"')
-                .collect();
-            if !rel.is_empty() {
-                out.push(rel);
+            // Tolerate the `${HERDR_PLUGIN_ROOT}/…` brace form, then the `/`.
+            let after = a[idx + ROOT.len()..]
+                .strip_prefix('}')
+                .unwrap_or(&a[idx + ROOT.len()..]);
+            if let Some(rest) = after.strip_prefix('/') {
+                let rel: String = rest
+                    .chars()
+                    .take_while(|c| !c.is_whitespace() && *c != '"')
+                    .collect();
+                if !rel.is_empty() {
+                    out.push(rel);
+                }
             }
         }
     }
     out
+}
+
+/// The program a pane will actually execute: argv[0] directly, or — when argv[0]
+/// is a shell launcher — the token it `exec`s. Lets the resolvability check below
+/// see the *real* program (`$HERDR_PLUGIN_ROOT/bin/lilbox-herdr`), not just `sh`.
+fn effective_pane_program(argv: &[String]) -> Option<String> {
+    let first = argv.first()?;
+    if matches!(first.as_str(), "sh" | "bash" | "dash") {
+        let script = argv.iter().find(|a| a.contains("exec "))?;
+        let after = script.split("exec ").nth(1)?.trim_start();
+        return Some(
+            after
+                .chars()
+                .skip_while(|c| *c == '"')
+                .take_while(|c| !c.is_whitespace() && *c != '"')
+                .collect(),
+        );
+    }
+    Some(first.clone())
 }
 
 #[test]
@@ -237,16 +262,19 @@ fn link_handlers_point_at_actions_this_plugin_declares() {
 fn pane_programs_are_path_resolvable() {
     for pane in section(&manifest(), "panes") {
         let id = str_at(&pane, "id").unwrap();
-        let argv = argv(&pane);
-        let program = argv
-            .first()
-            .unwrap_or_else(|| panic!("pane `{id}` has no command"));
-        let relative_with_slash = program.contains('/') && !program.starts_with('/');
+        let program = effective_pane_program(&argv(&pane))
+            .unwrap_or_else(|| panic!("pane `{id}` has no runnable program"));
+        // A bare PATH command (`sh`), an absolute path, or a `$HERDR_PLUGIN_ROOT`-
+        // rooted target all resolve. A relative path with a slash does not — and
+        // that's true whether it's argv[0] or the program the launcher execs, so
+        // we check the *effective* program, not just argv[0].
+        let resolvable =
+            !program.contains('/') || program.starts_with('/') || program.starts_with('$');
         assert!(
-            !relative_with_slash,
-            "pane `{id}` runs `{program}`: herdr's pane spawner PATH-searches argv[0], \
-             so a relative path never resolves. Use a bare command or an absolute path \
-             (e.g. `sh -c 'exec \"$HERDR_PLUGIN_ROOT/bin/lilbox-herdr\" {id}'`)."
+            resolvable,
+            "pane `{id}` runs `{program}`: herdr's pane spawner PATH-searches the program, \
+             so a relative path never resolves. Use a bare command, an absolute path, or one \
+             rooted at $HERDR_PLUGIN_ROOT (e.g. `sh -c 'exec \"$HERDR_PLUGIN_ROOT/bin/lilbox-herdr\" {id}'`)."
         );
     }
 }
