@@ -13,11 +13,14 @@ idle_timeout = "20m"
 max_cpus = 4
 max_memory = "8G"
 
-# Tailnet join. OAuth (mint an ephemeral, tagged, 5-minute key per box) takes
-# precedence over authKeyEnv (a static, pre-generated key); neither set skips
-# the tailnet join. See README.md's "Tailnet ACLs" section for details.
+# Tailnet join is opt-in: `lilbox new` only attempts it when you pass
+# --tailnet (or --tailnet-tag, or set auto = true below). OAuth (mint an
+# ephemeral, tagged, 5-minute key per box) takes precedence over authKeyEnv (a
+# static, pre-generated key); neither set skips the join. See README.md's
+# "Tailnet ACLs" section for details.
 [tailscale]
 tag = "tag:lilbox-vm"
 oauthClientId = "k123abc..."
 oauthClientSecretEnv = "TS_OAUTH_CLIENT_SECRET"
 # authKeyEnv = "TS_AUTHKEY"
+# auto = true                  # imply --tailnet on every `lilbox new`

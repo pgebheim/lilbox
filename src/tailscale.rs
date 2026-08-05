@@ -315,9 +315,28 @@ pub(crate) async fn mint_ephemeral_key(
     parse_minted_key(&body)
 }
 
+/// Whether `lilbox new` should put the box on the tailnet. Opt-in: a key merely
+/// present in the environment is NOT enough — the user must signal intent via
+/// `--tailnet`, `--tailnet-tag`, or `[tailscale] auto = true`.
+pub(crate) fn wants_tailnet(tailnet: bool, tailnet_tag: Option<&str>, auto: Option<bool>) -> bool {
+    tailnet || tailnet_tag.is_some() || auto.unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wants_tailnet_needs_explicit_intent() {
+        // No intent -> false. (A key present in the env is not consulted here;
+        // that's the whole point of the opt-in model.)
+        assert!(!wants_tailnet(false, None, None));
+        assert!(!wants_tailnet(false, None, Some(false)));
+        // Each intent source independently opts in.
+        assert!(wants_tailnet(true, None, None));
+        assert!(wants_tailnet(false, Some("tag:x"), None));
+        assert!(wants_tailnet(false, None, Some(true)));
+    }
 
     #[test]
     fn flag_overrides_config_and_default() {
@@ -518,6 +537,7 @@ mod tests {
             auth_key_env: auth_key_env.map(String::from),
             oauth_client_id: oauth_client_id.map(String::from),
             oauth_client_secret_env: oauth_client_secret_env.map(String::from),
+            auto: None,
         }
     }
 
