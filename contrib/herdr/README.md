@@ -72,6 +72,25 @@ command = "lilbox.agent"
 description = "run agent in lilbox"
 ```
 
+### Driving it over Herdr Mirror
+
+A `plugin_action` keybinding resolves on whichever herdr captures the prefix —
+under Mirror that's your **local** machine, where lilbox isn't installed, so the
+binding can't reach the box. Mirror forwards raw pane input but not prefix-mode
+commands, so binding it in the remote config doesn't fire either (setting it in
+both places can't bridge that). Two ways that work:
+
+- **Invoke from a mirrored remote pane.** That shell runs on the host, so
+  `herdr plugin action invoke lilbox.agent` hits the remote herdr and its plugin
+  with the pane's workspace context. The opened box pane mirrors back to your
+  sidebar.
+- **Drive the host's herdr directly** with `herdr --remote <host>
+  --remote-keybindings server`, so the remote's bindings resolve against the
+  remote plugin — at the cost of leaving Mirror's unified view.
+
+The `worktree.removed` teardown hook is unaffected: it's a remote-side event and
+fires regardless of how you drive herdr.
+
 ## Use
 
 | Action | Does |
@@ -84,7 +103,7 @@ description = "run agent in lilbox"
 | `lilbox.unexpose` | Stop publishing |
 | `lilbox.kill` | Destroy the box and its home volume |
 
-Invoke any of them from herdr's action menu, a keybinding, or:
+Invoke any of them with a keybinding, or over the CLI:
 
 ```bash
 herdr plugin action invoke lilbox.open
