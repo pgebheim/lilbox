@@ -1,29 +1,50 @@
 # lilbox
 
-**A lil [exe.dev](https://exe.dev) you run yourself.** Instant, isolated Linux
-boxes on your own machine, publishable to your tailnet over HTTPS with one
-command.
+**Instant, isolated Linux boxes on your own machine — publishable to your
+tailnet over HTTPS with one command.**
 
-exe.dev's pitch is *"VMs, on the internet, quickly"* — SSH into a fresh Linux
-box, run untrusted/AI-generated code in a disposable sandbox, and publish HTTP
-endpoints to the world. `lilbox` reproduces that experience on hardware **you**
-control by gluing together two pieces you can self-host:
+SSH into a fresh Linux box, run untrusted or AI-generated code behind a real
+KVM boundary, and publish HTTP endpoints — all on hardware **you** control.
+`lilbox` is a single Rust CLI that glues together two self-hostable pieces:
 
-| Layer | exe.dev | lilbox |
-|---|---|---|
-| Isolation | proprietary VMs | [**microsandbox**](https://microsandbox.dev) — libkrun microVMs (real kernel per box, KVM-isolated) |
-| Publishing | HTTP proxies + custom domains | [**Tailscale**](https://tailscale.com) Serve (tailnet HTTPS) / Funnel (public) |
-| Runtime | service-managed VMs | native Rust + embedded `microsandbox` SDK |
-| State | Go + SQLite ("GUTS") | Rust + SQLite |
+- [**microsandbox**](https://microsandbox.dev) — libkrun microVMs (a real
+  kernel per box, KVM-isolated), driven through the embedded Rust SDK.
+- [**Tailscale**](https://tailscale.com) — Serve (tailnet HTTPS) / Funnel
+  (public) for publishing.
 
 Each box is a genuine microVM — it boots its own Linux kernel in ~1–2s, not a
-container sharing yours.
+container sharing yours. `lilbox exec` reports a **different kernel version than
+the host**, because it *is* a different kernel.
 
-## Why microVMs (not containers)
+## How lilbox compares
 
-`lilbox exec` on a box reports a **different kernel version than the host** — because
-it *is* a different kernel. libkrun gives each box a KVM-backed boundary, which
-is the isolation you actually want when running code an LLM just wrote.
+Most dev sandboxing falls into three buckets — containers, the raw microVM
+primitive, or a cloud service. lilbox is the workflow layer that gives you the
+last one's ergonomics with the first two's locality:
+
+| | containers (Docker/Podman) | raw microsandbox | cloud sandboxes (E2B, Daytona, …) | **lilbox** |
+|---|---|---|---|---|
+| Isolation | shared host kernel | KVM microVM | vendor VMs | KVM microVM (libkrun) |
+| Runs on | your host | your host | someone else's cloud | **your host** |
+| Your code lives | local | local | round-trips as snapshots | **local — bind-mounts the live worktree** |
+| Named persistent devboxes | you script it | — | vendor-specific | built-in (`new` / `fork` / volumes) |
+| Publish over HTTPS | wire your own proxy | — | vendor URLs | one command (`expose`) |
+| Recurring cost | free | free | per-minute billing | free (your hardware) |
+| Agent-in-a-box | DIY | DIY | vendor SDK | `lilbox agent` |
+
+- **vs. containers** — a container shares your kernel; a lilbox box boots its
+  own. That KVM boundary is the isolation you actually want when running code an
+  LLM just wrote — a container escape lands on your host, a microVM escape lands
+  in an empty guest kernel.
+- **vs. raw microsandbox** — microsandbox is the isolation *primitive*; lilbox
+  is the developer *workflow* on top of it: named boxes, templates, persistent
+  home volumes, tailnet publishing, TTL/idle lifecycle, fork, and agent-in-a-box
+  — none of which you have to script yourself.
+- **vs. cloud sandboxes** — E2B, Daytona, Sprites, and friends give you
+  sandboxes on *their* hardware and round-trip your code as snapshots. lilbox
+  runs on hardware you own and bind-mounts the live worktree, so edits appear on
+  your host as they happen — no upload, no per-minute bill, nothing leaving your
+  machine.
 
 ## Requirements
 
@@ -76,7 +97,7 @@ lilbox fork web staging              # snapshot + clone (state and all)
 lilbox rm web                        # tear down (also unpublishes)
 ```
 
-Disposable, exe.dev-style sandbox for a one-off:
+Disposable sandbox for a one-off:
 
 ```bash
 lilbox run -- python3 -c 'print("ran in a throwaway microVM")'
