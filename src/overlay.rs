@@ -701,491 +701,554 @@ mod tests {
         format!("sha256:{}", byte.to_string().repeat(64))
     }
 
-    /// `(digest, declared size)` descriptors for `blobs`, in the given order.
-    fn descriptors_for(blobs: &[Vec<u8>]) -> Vec<(String, i64)> {
-        blobs
-            .iter()
-            .map(|bytes| (format!("sha256:{}", sha256_hex(bytes)), bytes.len() as i64))
-            .collect()
-    }
+    mod pair_layer_blobs {
+        use super::*;
 
-    /// The registry pull hands back layer blobs in *completion* order --
-    /// `oci_client::Client::pull` collects them with `buffer_unordered` -- so
-    /// they must be matched to descriptors by content hash. Pairing by position
-    /// files each blob under another layer's digest, and the image loader then
-    /// rejects the archive with "size mismatch: descriptor has N, archive has M".
-    #[test]
-    fn pairs_blobs_by_digest() {
-        // Manifest order, largest first -- the shape of a real base image.
-        let blobs: Vec<Vec<u8>> = vec![vec![b'a'; 4096], vec![b'b'; 512], vec![b'c'; 24]];
-        let descriptors = descriptors_for(&blobs);
-
-        // Arrival order: the 24-byte layer is last in the manifest but finished
-        // downloading first, so it lands at index 0. This is exactly the
-        // python:latest failure -- its 249-byte final layer arrived ahead of the
-        // 49 MB first one and was written under that layer's digest.
-        let arrived = vec![blobs[2].clone(), blobs[1].clone(), blobs[0].clone()];
-
-        let paired = pair_layer_blobs("docker.io/library/python:latest", &descriptors, arrived)
-            .expect("a blob set matching the manifest should pair");
-
-        let expected: Vec<(String, Vec<u8>)> = descriptors
-            .iter()
-            .zip(blobs.iter())
-            .map(|((digest, _), bytes)| (strip_sha256(digest).unwrap().to_string(), bytes.clone()))
-            .collect();
-        assert_eq!(
-            paired, expected,
-            "each blob must be filed under the digest of its own bytes, in manifest order"
-        );
-    }
-
-    /// A descriptor with no matching blob is a bad pull, not something to pass
-    /// downstream: fail here, naming the digest that went unmatched.
-    #[test]
-    fn rejects_unmatched_descriptor() {
-        let present = vec![b'a'; 32];
-        let absent = vec![b'z'; 32];
-        let descriptors = descriptors_for(&[present.clone(), absent.clone()]);
-
-        let error = pair_layer_blobs("img", &descriptors, vec![present])
-            .expect_err("a manifest layer with no downloaded blob should fail")
-            .to_string();
-        assert!(
-            error.contains(&sha256_hex(&absent)),
-            "error should name the unmatched digest: {error}"
-        );
-    }
-
-    /// Content hash and declared size have to agree; a disagreement means the
-    /// manifest describes something other than what arrived.
-    #[test]
-    fn rejects_size_disagreement() {
-        let bytes = vec![b'a'; 64];
-        let descriptors = vec![(format!("sha256:{}", sha256_hex(&bytes)), 4096)];
-
-        let error = pair_layer_blobs("img", &descriptors, vec![bytes])
-            .expect_err("a declared size that disagrees with the blob should fail")
-            .to_string();
-        assert!(
-            error.contains("64") && error.contains("4096"),
-            "error should report both sizes: {error}"
-        );
-    }
-
-    /// An image may list the same layer twice (a repeated empty tar, say). The
-    /// blob is pulled once and lives at one path in the archive, so it must be
-    /// emitted once rather than looked up a second time and reported missing.
-    #[test]
-    fn dedupes_repeated_digest() {
-        let bytes = vec![b'a'; 16];
-        let digest = format!("sha256:{}", sha256_hex(&bytes));
-        let descriptors = vec![(digest.clone(), 16), (digest.clone(), 16)];
-
-        let paired = pair_layer_blobs("img", &descriptors, vec![bytes.clone()])
-            .expect("a layer listed twice should pair against its single blob");
-        assert_eq!(
-            paired,
-            vec![(strip_sha256(&digest).unwrap().to_string(), bytes)]
-        );
-    }
-
-    /// Digests carry their algorithm prefix; anything but sha256 is unsupported
-    /// and must not be silently filed under a truncated key.
-    #[test]
-    fn rejects_non_sha256_digest() {
-        let bytes = vec![b'a'; 8];
-        let descriptors = vec![("sha512:beef".to_string(), 8)];
-
-        let error = pair_layer_blobs("img", &descriptors, vec![bytes])
-            .expect_err("a non-sha256 digest should fail")
-            .to_string();
-        assert!(error.contains("sha512:beef"), "{error}");
-    }
-
-    fn read_all_entries(path: &Path) -> HashMap<String, Vec<u8>> {
-        let file = std::fs::File::open(path).unwrap();
-        let mut archive = tar::Archive::new(file);
-        let mut out = HashMap::new();
-        for entry in archive.entries().unwrap() {
-            let mut entry = entry.unwrap();
-            let entry_path = entry.path().unwrap().to_string_lossy().into_owned();
-            let mut data = Vec::new();
-            entry.read_to_end(&mut data).unwrap();
-            out.insert(entry_path, data);
+        /// `(digest, declared size)` descriptors for `blobs`, in the given order.
+        fn descriptors_for(blobs: &[Vec<u8>]) -> Vec<(String, i64)> {
+            blobs
+                .iter()
+                .map(|bytes| (format!("sha256:{}", sha256_hex(bytes)), bytes.len() as i64))
+                .collect()
         }
-        out
+
+        /// The registry pull hands back layer blobs in *completion* order --
+        /// `oci_client::Client::pull` collects them with `buffer_unordered` -- so
+        /// they must be matched to descriptors by content hash. Pairing by position
+        /// files each blob under another layer's digest, and the image loader then
+        /// rejects the archive with "size mismatch: descriptor has N, archive has M".
+        #[test]
+        fn pairs_by_digest() {
+            // Manifest order, largest first -- the shape of a real base image.
+            let blobs: Vec<Vec<u8>> = vec![vec![b'a'; 4096], vec![b'b'; 512], vec![b'c'; 24]];
+            let descriptors = descriptors_for(&blobs);
+
+            // Arrival order: the 24-byte layer is last in the manifest but finished
+            // downloading first, so it lands at index 0. This is exactly the
+            // python:latest failure -- its 249-byte final layer arrived ahead of the
+            // 49 MB first one and was written under that layer's digest.
+            let arrived = vec![blobs[2].clone(), blobs[1].clone(), blobs[0].clone()];
+
+            let paired = pair_layer_blobs("docker.io/library/python:latest", &descriptors, arrived)
+                .expect("a blob set matching the manifest should pair");
+
+            let expected: Vec<(String, Vec<u8>)> = descriptors
+                .iter()
+                .zip(blobs.iter())
+                .map(|((digest, _), bytes)| {
+                    (strip_sha256(digest).unwrap().to_string(), bytes.clone())
+                })
+                .collect();
+            assert_eq!(
+                paired, expected,
+                "each blob must be filed under the digest of its own bytes, in manifest order"
+            );
+        }
+
+        /// A descriptor with no matching blob is a bad pull, not something to pass
+        /// downstream: fail here, naming the digest that went unmatched.
+        #[test]
+        fn rejects_unmatched_descriptor() {
+            let present = vec![b'a'; 32];
+            let absent = vec![b'z'; 32];
+            let descriptors = descriptors_for(&[present.clone(), absent.clone()]);
+
+            let error = pair_layer_blobs("img", &descriptors, vec![present])
+                .expect_err("a manifest layer with no downloaded blob should fail")
+                .to_string();
+            assert!(
+                error.contains(&sha256_hex(&absent)),
+                "error should name the unmatched digest: {error}"
+            );
+        }
+
+        /// Content hash and declared size have to agree; a disagreement means the
+        /// manifest describes something other than what arrived.
+        #[test]
+        fn rejects_size_disagreement() {
+            let bytes = vec![b'a'; 64];
+            let descriptors = vec![(format!("sha256:{}", sha256_hex(&bytes)), 4096)];
+
+            let error = pair_layer_blobs("img", &descriptors, vec![bytes])
+                .expect_err("a declared size that disagrees with the blob should fail")
+                .to_string();
+            assert!(
+                error.contains("64") && error.contains("4096"),
+                "error should report both sizes: {error}"
+            );
+        }
+
+        /// An image may list the same layer twice (a repeated empty tar, say). The
+        /// blob is pulled once and lives at one path in the archive, so it must be
+        /// emitted once rather than looked up a second time and reported missing.
+        #[test]
+        fn dedupes_repeated_digest() {
+            let bytes = vec![b'a'; 16];
+            let digest = format!("sha256:{}", sha256_hex(&bytes));
+            let descriptors = vec![(digest.clone(), 16), (digest.clone(), 16)];
+
+            let paired = pair_layer_blobs("img", &descriptors, vec![bytes.clone()])
+                .expect("a layer listed twice should pair against its single blob");
+            assert_eq!(
+                paired,
+                vec![(strip_sha256(&digest).unwrap().to_string(), bytes)]
+            );
+        }
+
+        /// Digests carry their algorithm prefix; anything but sha256 is unsupported
+        /// and must not be silently filed under a truncated key.
+        #[test]
+        fn rejects_non_sha256() {
+            let bytes = vec![b'a'; 8];
+            let descriptors = vec![("sha512:beef".to_string(), 8)];
+
+            let error = pair_layer_blobs("img", &descriptors, vec![bytes])
+                .expect_err("a non-sha256 digest should fail")
+                .to_string();
+            assert!(error.contains("sha512:beef"), "{error}");
+        }
     }
 
-    #[test]
-    fn build_layer_computes_distinct_deterministic_digests() {
-        let files = vec![("etc/lilbox-overlay".to_string(), b"v1\n".to_vec(), 0o644u32)];
+    mod build_layer {
+        use super::*;
 
-        let (gzip_a, layer_digest_a, diff_id_a) = build_layer(&files).unwrap();
-        let (gzip_b, layer_digest_b, diff_id_b) = build_layer(&files).unwrap();
+        /// `layer_digest` and `diff_id` cover different content -- the gzip bytes
+        /// and the uncompressed tar respectively -- so they must differ, and each
+        /// must equal the sha256 of the content it names. Identical inputs must
+        /// also produce byte-identical output, since the digests are the layer's
+        /// identity.
+        #[test]
+        fn computes_distinct_digests() {
+            let files = vec![("etc/lilbox-overlay".to_string(), b"v1\n".to_vec(), 0o644u32)];
 
-        assert!(layer_digest_a.starts_with("sha256:"));
-        assert!(diff_id_a.starts_with("sha256:"));
-        assert_ne!(
-            layer_digest_a, diff_id_a,
-            "layer digest and diff_id cover different content"
-        );
+            let (gzip_a, layer_digest_a, diff_id_a) = build_layer(&files).unwrap();
+            let (gzip_b, layer_digest_b, diff_id_b) = build_layer(&files).unwrap();
 
-        // Deterministic: identical inputs produce identical outputs.
-        assert_eq!(layer_digest_a, layer_digest_b);
-        assert_eq!(diff_id_a, diff_id_b);
-        assert_eq!(gzip_a, gzip_b);
+            assert!(layer_digest_a.starts_with("sha256:"));
+            assert!(diff_id_a.starts_with("sha256:"));
+            assert_ne!(
+                layer_digest_a, diff_id_a,
+                "layer digest and diff_id cover different content"
+            );
 
-        // diff_id must equal the sha256 of the UNCOMPRESSED tar.
-        let mut decoder = flate2::read::GzDecoder::new(gzip_a.as_slice());
-        let mut tar_bytes = Vec::new();
-        decoder.read_to_end(&mut tar_bytes).unwrap();
-        assert_eq!(diff_id_a, format!("sha256:{}", sha256_hex(&tar_bytes)));
+            // Deterministic: identical inputs produce identical outputs.
+            assert_eq!(layer_digest_a, layer_digest_b);
+            assert_eq!(diff_id_a, diff_id_b);
+            assert_eq!(gzip_a, gzip_b);
 
-        // layer_digest must equal the sha256 of the COMPRESSED (gzip) bytes.
-        assert_eq!(layer_digest_a, format!("sha256:{}", sha256_hex(&gzip_a)));
+            // diff_id must equal the sha256 of the UNCOMPRESSED tar.
+            let mut decoder = flate2::read::GzDecoder::new(gzip_a.as_slice());
+            let mut tar_bytes = Vec::new();
+            decoder.read_to_end(&mut tar_bytes).unwrap();
+            assert_eq!(diff_id_a, format!("sha256:{}", sha256_hex(&tar_bytes)));
 
-        // The per-file mode passed to build_layer is honored in the tar header.
-        let mut archive = tar::Archive::new(tar_bytes.as_slice());
-        let entry = archive.entries().unwrap().next().unwrap().unwrap();
-        assert_eq!(entry.header().mode().unwrap(), 0o644);
+            // layer_digest must equal the sha256 of the COMPRESSED (gzip) bytes.
+            assert_eq!(layer_digest_a, format!("sha256:{}", sha256_hex(&gzip_a)));
+
+            // The per-file mode passed to build_layer is honored in the tar header.
+            let mut archive = tar::Archive::new(tar_bytes.as_slice());
+            let entry = archive.entries().unwrap().next().unwrap().unwrap();
+            assert_eq!(entry.header().mode().unwrap(), 0o644);
+        }
+
+        /// A binary needs the executable bit to survive into the tar header, or
+        /// the guest can't run it.
+        #[test]
+        fn honors_executable_mode() {
+            let files = vec![(
+                "usr/local/bin/tailscale".to_string(),
+                b"bin".to_vec(),
+                0o755u32,
+            )];
+
+            let (gzip, _, _) = build_layer(&files).unwrap();
+            let mut decoder = flate2::read::GzDecoder::new(gzip.as_slice());
+            let mut tar_bytes = Vec::new();
+            decoder.read_to_end(&mut tar_bytes).unwrap();
+
+            let mut archive = tar::Archive::new(tar_bytes.as_slice());
+            let entry = archive.entries().unwrap().next().unwrap().unwrap();
+            assert_eq!(entry.header().mode().unwrap(), 0o755);
+        }
     }
 
-    #[test]
-    fn build_layer_honors_executable_mode() {
-        let files = vec![(
-            "usr/local/bin/tailscale".to_string(),
-            b"bin".to_vec(),
-            0o755u32,
-        )];
+    mod tailscale_layer_files {
+        use super::*;
 
-        let (gzip, _, _) = build_layer(&files).unwrap();
-        let mut decoder = flate2::read::GzDecoder::new(gzip.as_slice());
-        let mut tar_bytes = Vec::new();
-        decoder.read_to_end(&mut tar_bytes).unwrap();
+        fn synthetic_tailscale_tarball(version: &str, arch: &str) -> Vec<u8> {
+            let prefix = format!("tailscale_{version}_{arch}");
+            let files = vec![
+                (
+                    format!("{prefix}/tailscale"),
+                    b"fake tailscale binary".to_vec(),
+                ),
+                (
+                    format!("{prefix}/tailscaled"),
+                    b"fake tailscaled binary".to_vec(),
+                ),
+                (format!("{prefix}/README"), b"not a binary".to_vec()),
+            ];
 
-        let mut archive = tar::Archive::new(tar_bytes.as_slice());
-        let entry = archive.entries().unwrap().next().unwrap().unwrap();
-        assert_eq!(entry.header().mode().unwrap(), 0o755);
-    }
+            let mut tar_bytes = Vec::new();
+            {
+                let mut builder = tar::Builder::new(&mut tar_bytes);
+                for (path, data) in &files {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(data.len() as u64);
+                    header.set_mode(0o755);
+                    header.set_cksum();
+                    builder
+                        .append_data(&mut header, path, data.as_slice())
+                        .unwrap();
+                }
+                builder.finish().unwrap();
+            }
 
-    fn synthetic_tailscale_tarball(version: &str, arch: &str) -> Vec<u8> {
-        let prefix = format!("tailscale_{version}_{arch}");
-        let files = vec![
-            (
-                format!("{prefix}/tailscale"),
-                b"fake tailscale binary".to_vec(),
-            ),
-            (
-                format!("{prefix}/tailscaled"),
-                b"fake tailscaled binary".to_vec(),
-            ),
-            (format!("{prefix}/README"), b"not a binary".to_vec()),
-        ];
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&tar_bytes).unwrap();
+            encoder.finish().unwrap()
+        }
 
-        let mut tar_bytes = Vec::new();
-        {
-            let mut builder = tar::Builder::new(&mut tar_bytes);
-            for (path, data) in &files {
+        /// Both binaries land executable under `usr/local/bin`, alongside the
+        /// embedded first-boot hook. Non-binaries in the release tarball (its
+        /// README) are left out.
+        #[test]
+        fn extracts_binaries() {
+            let version = "1.102.2";
+            let arch = "amd64";
+            let tarball_gz = synthetic_tailscale_tarball(version, arch);
+
+            let files = tailscale_layer_files(&tarball_gz, version, arch).unwrap();
+            let by_path: HashMap<String, (Vec<u8>, u32)> = files
+                .into_iter()
+                .map(|(path, data, mode)| (path, (data, mode)))
+                .collect();
+
+            let (tailscaled_data, tailscaled_mode) =
+                by_path.get("usr/local/bin/tailscaled").unwrap();
+            assert_eq!(tailscaled_data, b"fake tailscaled binary");
+            assert_eq!(*tailscaled_mode, 0o755);
+
+            let (tailscale_data, tailscale_mode) = by_path.get("usr/local/bin/tailscale").unwrap();
+            assert_eq!(tailscale_data, b"fake tailscale binary");
+            assert_eq!(*tailscale_mode, 0o755);
+
+            let (boot_data, boot_mode) = by_path.get("usr/local/bin/lilbox-boot").unwrap();
+            assert_eq!(std::str::from_utf8(boot_data).unwrap(), LILBOX_BOOT);
+            assert_eq!(*boot_mode, 0o755);
+        }
+
+        /// A tarball missing `tailscaled` can't produce a working layer, and the
+        /// error says which binary was absent.
+        #[test]
+        fn errors_when_missing() {
+            let version = "1.102.2";
+            let arch = "amd64";
+            let prefix = format!("tailscale_{version}_{arch}");
+
+            let mut tar_bytes = Vec::new();
+            {
+                let mut builder = tar::Builder::new(&mut tar_bytes);
+                let data = b"fake tailscale binary".to_vec();
                 let mut header = tar::Header::new_gnu();
                 header.set_size(data.len() as u64);
                 header.set_mode(0o755);
                 header.set_cksum();
                 builder
-                    .append_data(&mut header, path, data.as_slice())
+                    .append_data(&mut header, format!("{prefix}/tailscale"), data.as_slice())
                     .unwrap();
+                builder.finish().unwrap();
             }
-            builder.finish().unwrap();
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&tar_bytes).unwrap();
+            let tarball_gz = encoder.finish().unwrap();
+
+            let err = tailscale_layer_files(&tarball_gz, version, arch).unwrap_err();
+            assert!(err.to_string().contains("tailscaled"));
+        }
+    }
+
+    mod tailnet_image_tag {
+        use super::*;
+
+        /// The tag is the cache key, so the same base must always map to it.
+        #[test]
+        fn is_deterministic() {
+            let base = "docker.io/library/alpine:latest";
+            assert_eq!(tailnet_image_tag(base), tailnet_image_tag(base));
         }
 
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&tar_bytes).unwrap();
-        encoder.finish().unwrap()
+        /// Docker Hub's registry host and `library/` official-image prefix are
+        /// both stripped.
+        #[test]
+        fn sanitizes_official_image() {
+            assert_eq!(
+                tailnet_image_tag("docker.io/library/alpine:latest"),
+                format!("lilbox/tailnet/alpine-latest-ts{TAILSCALE_VERSION}")
+            );
+        }
+
+        /// A non-Docker-Hub ref keeps its path but has every character outside
+        /// `[a-z0-9._-]` replaced, since the result has to be a valid tag.
+        #[test]
+        fn sanitizes_ghcr_ref() {
+            let tag = tailnet_image_tag("ghcr.io/foo/bar:v1.0");
+            assert_eq!(
+                tag,
+                format!("lilbox/tailnet/foo-bar-v1.0-ts{TAILSCALE_VERSION}")
+            );
+            let sanitized = tag.strip_prefix("lilbox/tailnet/").unwrap();
+            assert!(
+                sanitized.chars().all(|c| c.is_ascii_lowercase()
+                    || c.is_ascii_digit()
+                    || matches!(c, '.' | '_' | '-')),
+                "sanitized portion '{sanitized}' contains an invalid tag character"
+            );
+        }
+
+        /// The Tailscale version is part of the tag, so bumping it invalidates
+        /// every cached image rather than serving a stale one.
+        #[test]
+        fn contains_version() {
+            assert!(
+                tailnet_image_tag("alpine:latest").ends_with(&format!("-ts{TAILSCALE_VERSION}"))
+            );
+        }
     }
 
-    #[test]
-    fn tailscale_layer_files_extracts_binaries_and_boot_hook() {
-        let version = "1.102.2";
-        let arch = "amd64";
-        let tarball_gz = synthetic_tailscale_tarball(version, arch);
+    mod append_layer_to_config {
+        use super::*;
 
-        let files = tailscale_layer_files(&tarball_gz, version, arch).unwrap();
-        let by_path: HashMap<String, (Vec<u8>, u32)> = files
-            .into_iter()
-            .map(|(path, data, mode)| (path, (data, mode)))
-            .collect();
-
-        let (tailscaled_data, tailscaled_mode) = by_path.get("usr/local/bin/tailscaled").unwrap();
-        assert_eq!(tailscaled_data, b"fake tailscaled binary");
-        assert_eq!(*tailscaled_mode, 0o755);
-
-        let (tailscale_data, tailscale_mode) = by_path.get("usr/local/bin/tailscale").unwrap();
-        assert_eq!(tailscale_data, b"fake tailscale binary");
-        assert_eq!(*tailscale_mode, 0o755);
-
-        let (boot_data, boot_mode) = by_path.get("usr/local/bin/lilbox-boot").unwrap();
-        assert_eq!(std::str::from_utf8(boot_data).unwrap(), LILBOX_BOOT);
-        assert_eq!(*boot_mode, 0o755);
-    }
-
-    #[test]
-    fn tailscale_layer_files_errors_when_binary_missing() {
-        let version = "1.102.2";
-        let arch = "amd64";
-        let prefix = format!("tailscale_{version}_{arch}");
-
-        let mut tar_bytes = Vec::new();
-        {
-            let mut builder = tar::Builder::new(&mut tar_bytes);
-            let data = b"fake tailscale binary".to_vec();
-            let mut header = tar::Header::new_gnu();
-            header.set_size(data.len() as u64);
-            header.set_mode(0o755);
-            header.set_cksum();
-            builder
-                .append_data(&mut header, format!("{prefix}/tailscale"), data.as_slice())
+        /// The new diff_id is appended to `rootfs.diff_ids` (order matters --
+        /// it's the layer application order), a history entry is recorded, and
+        /// the returned digest matches the emitted JSON.
+        #[test]
+        fn pushes_diff_id() {
+            let base_config = ImageConfigurationBuilder::default()
+                .architecture(Arch::Amd64)
+                .os(Os::Linux)
+                .rootfs(
+                    RootFsBuilder::default()
+                        .typ("layers".to_string())
+                        .diff_ids(vec![fake_digest('a')])
+                        .build()
+                        .unwrap(),
+                )
+                .build()
                 .unwrap();
-            builder.finish().unwrap();
+            let base_json = serde_json::to_vec(&base_config).unwrap();
+
+            let new_diff_id = fake_digest('b');
+            let (new_json, digest) = append_layer_to_config(&base_json, &new_diff_id).unwrap();
+
+            let parsed: ImageConfiguration = serde_json::from_slice(&new_json).unwrap();
+            assert_eq!(
+                parsed.rootfs().diff_ids(),
+                &vec![fake_digest('a'), new_diff_id]
+            );
+            assert_eq!(parsed.history().as_ref().map(Vec::len), Some(1));
+            assert_eq!(digest, format!("sha256:{}", sha256_hex(&new_json)));
         }
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&tar_bytes).unwrap();
-        let tarball_gz = encoder.finish().unwrap();
-
-        let err = tailscale_layer_files(&tarball_gz, version, arch).unwrap_err();
-        assert!(err.to_string().contains("tailscaled"));
     }
 
-    #[test]
-    fn tailnet_image_tag_is_deterministic() {
-        let base = "docker.io/library/alpine:latest";
-        assert_eq!(tailnet_image_tag(base), tailnet_image_tag(base));
-    }
+    mod append_layer_to_manifest {
+        use super::*;
 
-    #[test]
-    fn tailnet_image_tag_sanitizes_docker_hub_official_image() {
-        assert_eq!(
-            tailnet_image_tag("docker.io/library/alpine:latest"),
-            format!("lilbox/tailnet/alpine-latest-ts{TAILSCALE_VERSION}")
-        );
-    }
+        /// The new layer goes on top of the existing ones and the config
+        /// descriptor is replaced (not appended), since a manifest has exactly
+        /// one config.
+        #[test]
+        fn appends_and_swaps_config() {
+            let base_layer = DescriptorBuilder::default()
+                .media_type(MediaType::ImageLayerGzip)
+                .digest(OciDigest::from_str(&fake_digest('1')).unwrap())
+                .size(10u64)
+                .build()
+                .unwrap();
+            let base_config_descriptor = DescriptorBuilder::default()
+                .media_type(MediaType::ImageConfig)
+                .digest(OciDigest::from_str(&fake_digest('2')).unwrap())
+                .size(20u64)
+                .build()
+                .unwrap();
+            let base_manifest = ImageManifestBuilder::default()
+                .schema_version(2u32)
+                .config(base_config_descriptor)
+                .layers(vec![base_layer.clone()])
+                .build()
+                .unwrap();
+            let base_manifest_json = serde_json::to_vec(&base_manifest).unwrap();
 
-    #[test]
-    fn tailnet_image_tag_sanitizes_ghcr_ref_to_valid_chars() {
-        let tag = tailnet_image_tag("ghcr.io/foo/bar:v1.0");
-        assert_eq!(
-            tag,
-            format!("lilbox/tailnet/foo-bar-v1.0-ts{TAILSCALE_VERSION}")
-        );
-        let sanitized = tag.strip_prefix("lilbox/tailnet/").unwrap();
-        assert!(
-            sanitized.chars().all(|c| c.is_ascii_lowercase()
-                || c.is_ascii_digit()
-                || matches!(c, '.' | '_' | '-')),
-            "sanitized portion '{sanitized}' contains an invalid tag character"
-        );
-    }
+            let new_layer = DescriptorBuilder::default()
+                .media_type(MediaType::ImageLayerGzip)
+                .digest(OciDigest::from_str(&fake_digest('3')).unwrap())
+                .size(30u64)
+                .build()
+                .unwrap();
+            let new_config_descriptor = DescriptorBuilder::default()
+                .media_type(MediaType::ImageConfig)
+                .digest(OciDigest::from_str(&fake_digest('4')).unwrap())
+                .size(40u64)
+                .build()
+                .unwrap();
 
-    #[test]
-    fn tailnet_image_tag_contains_tailscale_version() {
-        assert!(tailnet_image_tag("alpine:latest").ends_with(&format!("-ts{TAILSCALE_VERSION}")));
-    }
-
-    #[test]
-    fn append_layer_to_config_pushes_diff_id_and_records_history() {
-        let base_config = ImageConfigurationBuilder::default()
-            .architecture(Arch::Amd64)
-            .os(Os::Linux)
-            .rootfs(
-                RootFsBuilder::default()
-                    .typ("layers".to_string())
-                    .diff_ids(vec![fake_digest('a')])
-                    .build()
-                    .unwrap(),
+            let (new_manifest_json, digest) = append_layer_to_manifest(
+                &base_manifest_json,
+                new_layer.clone(),
+                new_config_descriptor.clone(),
             )
-            .build()
             .unwrap();
-        let base_json = serde_json::to_vec(&base_config).unwrap();
 
-        let new_diff_id = fake_digest('b');
-        let (new_json, digest) = append_layer_to_config(&base_json, &new_diff_id).unwrap();
-
-        let parsed: ImageConfiguration = serde_json::from_slice(&new_json).unwrap();
-        assert_eq!(
-            parsed.rootfs().diff_ids(),
-            &vec![fake_digest('a'), new_diff_id]
-        );
-        assert_eq!(parsed.history().as_ref().map(Vec::len), Some(1));
-        assert_eq!(digest, format!("sha256:{}", sha256_hex(&new_json)));
+            let parsed: ImageManifest = serde_json::from_slice(&new_manifest_json).unwrap();
+            assert_eq!(parsed.layers().len(), 2);
+            assert_eq!(parsed.layers()[0], base_layer);
+            assert_eq!(parsed.layers()[1], new_layer);
+            assert_eq!(parsed.config(), &new_config_descriptor);
+            assert_eq!(digest, format!("sha256:{}", sha256_hex(&new_manifest_json)));
+        }
     }
 
-    #[test]
-    fn append_layer_to_manifest_appends_layer_and_swaps_config() {
-        let base_layer = DescriptorBuilder::default()
-            .media_type(MediaType::ImageLayerGzip)
-            .digest(OciDigest::from_str(&fake_digest('1')).unwrap())
-            .size(10u64)
-            .build()
-            .unwrap();
-        let base_config_descriptor = DescriptorBuilder::default()
-            .media_type(MediaType::ImageConfig)
-            .digest(OciDigest::from_str(&fake_digest('2')).unwrap())
-            .size(20u64)
-            .build()
-            .unwrap();
-        let base_manifest = ImageManifestBuilder::default()
-            .schema_version(2u32)
-            .config(base_config_descriptor)
-            .layers(vec![base_layer.clone()])
-            .build()
-            .unwrap();
-        let base_manifest_json = serde_json::to_vec(&base_manifest).unwrap();
+    mod write_oci_archive {
+        use super::*;
 
-        let new_layer = DescriptorBuilder::default()
-            .media_type(MediaType::ImageLayerGzip)
-            .digest(OciDigest::from_str(&fake_digest('3')).unwrap())
-            .size(30u64)
-            .build()
-            .unwrap();
-        let new_config_descriptor = DescriptorBuilder::default()
-            .media_type(MediaType::ImageConfig)
-            .digest(OciDigest::from_str(&fake_digest('4')).unwrap())
-            .size(40u64)
-            .build()
-            .unwrap();
+        fn read_all_entries(path: &Path) -> HashMap<String, Vec<u8>> {
+            let file = std::fs::File::open(path).unwrap();
+            let mut archive = tar::Archive::new(file);
+            let mut out = HashMap::new();
+            for entry in archive.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                let entry_path = entry.path().unwrap().to_string_lossy().into_owned();
+                let mut data = Vec::new();
+                entry.read_to_end(&mut data).unwrap();
+                out.insert(entry_path, data);
+            }
+            out
+        }
 
-        let (new_manifest_json, digest) = append_layer_to_manifest(
-            &base_manifest_json,
-            new_layer.clone(),
-            new_config_descriptor.clone(),
-        )
-        .unwrap();
+        /// Round-trips a synthetic single-layer image through the writer and back
+        /// out of the tar, checking the layout markers, the index's tag
+        /// annotation, and -- for the config and every layer -- that each blob
+        /// hashes to the digest it's filed under and matches its descriptor size.
+        /// That is what `Image::load` verifies before it trusts the archive.
+        #[test]
+        fn round_trips_digests() {
+            // A minimal, hand-built synthetic base: one tiny layer, a config
+            // whose rootfs references it, and a manifest tying both together.
+            let layer_bytes = b"hello layer".to_vec();
+            let layer_hex = sha256_hex(&layer_bytes);
+            let layer_digest = format!("sha256:{layer_hex}");
 
-        let parsed: ImageManifest = serde_json::from_slice(&new_manifest_json).unwrap();
-        assert_eq!(parsed.layers().len(), 2);
-        assert_eq!(parsed.layers()[0], base_layer);
-        assert_eq!(parsed.layers()[1], new_layer);
-        assert_eq!(parsed.config(), &new_config_descriptor);
-        assert_eq!(digest, format!("sha256:{}", sha256_hex(&new_manifest_json)));
-    }
+            let config = ImageConfigurationBuilder::default()
+                .architecture(Arch::Amd64)
+                .os(Os::Linux)
+                .rootfs(
+                    RootFsBuilder::default()
+                        .typ("layers".to_string())
+                        .diff_ids(vec![layer_digest.clone()])
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap();
+            let config_bytes = serde_json::to_vec(&config).unwrap();
+            let config_digest = format!("sha256:{}", sha256_hex(&config_bytes));
 
-    #[test]
-    fn write_oci_archive_round_trips_verifiable_digests() {
-        // A minimal, hand-built synthetic base: one tiny layer, a config
-        // whose rootfs references it, and a manifest tying both together.
-        let layer_bytes = b"hello layer".to_vec();
-        let layer_hex = sha256_hex(&layer_bytes);
-        let layer_digest = format!("sha256:{layer_hex}");
+            let layer_descriptor = DescriptorBuilder::default()
+                .media_type(MediaType::ImageLayerGzip)
+                .digest(OciDigest::from_str(&layer_digest).unwrap())
+                .size(layer_bytes.len() as u64)
+                .build()
+                .unwrap();
+            let config_descriptor = DescriptorBuilder::default()
+                .media_type(MediaType::ImageConfig)
+                .digest(OciDigest::from_str(&config_digest).unwrap())
+                .size(config_bytes.len() as u64)
+                .build()
+                .unwrap();
+            let manifest = ImageManifestBuilder::default()
+                .schema_version(2u32)
+                .config(config_descriptor)
+                .layers(vec![layer_descriptor])
+                .build()
+                .unwrap();
+            let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+            let manifest_digest = format!("sha256:{}", sha256_hex(&manifest_bytes));
 
-        let config = ImageConfigurationBuilder::default()
-            .architecture(Arch::Amd64)
-            .os(Os::Linux)
-            .rootfs(
-                RootFsBuilder::default()
-                    .typ("layers".to_string())
-                    .diff_ids(vec![layer_digest.clone()])
-                    .build()
-                    .unwrap(),
+            let dir = std::env::temp_dir().join(format!(
+                "lilbox-overlay-write-test-{}-{}",
+                std::process::id(),
+                now()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let archive_path = dir.join("image.tar");
+
+            write_oci_archive(
+                &archive_path,
+                &config_bytes,
+                &config_digest,
+                &manifest_bytes,
+                &manifest_digest,
+                &[(layer_hex.clone(), layer_bytes.clone())],
+                "lilbox-test:overlay",
             )
-            .build()
             .unwrap();
-        let config_bytes = serde_json::to_vec(&config).unwrap();
-        let config_digest = format!("sha256:{}", sha256_hex(&config_bytes));
 
-        let layer_descriptor = DescriptorBuilder::default()
-            .media_type(MediaType::ImageLayerGzip)
-            .digest(OciDigest::from_str(&layer_digest).unwrap())
-            .size(layer_bytes.len() as u64)
-            .build()
-            .unwrap();
-        let config_descriptor = DescriptorBuilder::default()
-            .media_type(MediaType::ImageConfig)
-            .digest(OciDigest::from_str(&config_digest).unwrap())
-            .size(config_bytes.len() as u64)
-            .build()
-            .unwrap();
-        let manifest = ImageManifestBuilder::default()
-            .schema_version(2u32)
-            .config(config_descriptor)
-            .layers(vec![layer_descriptor])
-            .build()
-            .unwrap();
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        let manifest_digest = format!("sha256:{}", sha256_hex(&manifest_bytes));
+            let entries = read_all_entries(&archive_path);
+            let _ = std::fs::remove_dir_all(&dir);
 
-        let dir = std::env::temp_dir().join(format!(
-            "lilbox-overlay-write-test-{}-{}",
-            std::process::id(),
-            now()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let archive_path = dir.join("image.tar");
+            let layout: oci_spec::image::OciLayout =
+                serde_json::from_slice(entries.get("oci-layout").expect("oci-layout present"))
+                    .expect("oci-layout parses");
+            assert_eq!(layout.image_layout_version(), "1.0.0");
 
-        write_oci_archive(
-            &archive_path,
-            &config_bytes,
-            &config_digest,
-            &manifest_bytes,
-            &manifest_digest,
-            &[(layer_hex.clone(), layer_bytes.clone())],
-            "lilbox-test:overlay",
-        )
-        .unwrap();
+            let index: oci_spec::image::ImageIndex =
+                serde_json::from_slice(entries.get("index.json").expect("index.json present"))
+                    .expect("index.json parses");
+            assert_eq!(index.manifests().len(), 1);
+            let manifest_entry = &index.manifests()[0];
+            assert_eq!(manifest_entry.digest().to_string(), manifest_digest);
+            assert_eq!(manifest_entry.size(), manifest_bytes.len() as u64);
+            assert_eq!(
+                manifest_entry
+                    .annotations()
+                    .as_ref()
+                    .and_then(|a| a.get(OCI_REF_NAME_ANNOTATION)),
+                Some(&"lilbox-test:overlay".to_string())
+            );
 
-        let entries = read_all_entries(&archive_path);
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let layout: oci_spec::image::OciLayout =
-            serde_json::from_slice(entries.get("oci-layout").expect("oci-layout present"))
-                .expect("oci-layout parses");
-        assert_eq!(layout.image_layout_version(), "1.0.0");
-
-        let index: oci_spec::image::ImageIndex =
-            serde_json::from_slice(entries.get("index.json").expect("index.json present"))
-                .expect("index.json parses");
-        assert_eq!(index.manifests().len(), 1);
-        let manifest_entry = &index.manifests()[0];
-        assert_eq!(manifest_entry.digest().to_string(), manifest_digest);
-        assert_eq!(manifest_entry.size(), manifest_bytes.len() as u64);
-        assert_eq!(
-            manifest_entry
-                .annotations()
-                .as_ref()
-                .and_then(|a| a.get(OCI_REF_NAME_ANNOTATION)),
-            Some(&"lilbox-test:overlay".to_string())
-        );
-
-        let manifest_blob = entries
-            .get(&format!(
-                "blobs/sha256/{}",
+            let manifest_blob = entries
+                .get(&format!(
+                    "blobs/sha256/{}",
+                    strip_sha256(&manifest_digest).unwrap()
+                ))
+                .expect("manifest blob present");
+            assert_eq!(
+                sha256_hex(manifest_blob),
                 strip_sha256(&manifest_digest).unwrap()
-            ))
-            .expect("manifest blob present");
-        assert_eq!(
-            sha256_hex(manifest_blob),
-            strip_sha256(&manifest_digest).unwrap()
-        );
-        let parsed_manifest: ImageManifest =
-            serde_json::from_slice(manifest_blob).expect("manifest blob parses");
+            );
+            let parsed_manifest: ImageManifest =
+                serde_json::from_slice(manifest_blob).expect("manifest blob parses");
 
-        let config_blob = entries
-            .get(&format!(
-                "blobs/sha256/{}",
+            let config_blob = entries
+                .get(&format!(
+                    "blobs/sha256/{}",
+                    parsed_manifest.config().digest().digest()
+                ))
+                .expect("config blob present");
+            assert_eq!(
+                sha256_hex(config_blob),
                 parsed_manifest.config().digest().digest()
-            ))
-            .expect("config blob present");
-        assert_eq!(
-            sha256_hex(config_blob),
-            parsed_manifest.config().digest().digest()
-        );
-        assert_eq!(config_blob.len() as u64, parsed_manifest.config().size());
+            );
+            assert_eq!(config_blob.len() as u64, parsed_manifest.config().size());
 
-        assert_eq!(parsed_manifest.layers().len(), 1);
-        for layer in parsed_manifest.layers() {
-            let blob = entries
-                .get(&format!("blobs/sha256/{}", layer.digest().digest()))
-                .expect("layer blob present for every manifest layer descriptor");
-            assert_eq!(sha256_hex(blob), layer.digest().digest());
-            assert_eq!(blob.len() as u64, layer.size());
+            assert_eq!(parsed_manifest.layers().len(), 1);
+            for layer in parsed_manifest.layers() {
+                let blob = entries
+                    .get(&format!("blobs/sha256/{}", layer.digest().digest()))
+                    .expect("layer blob present for every manifest layer descriptor");
+                assert_eq!(sha256_hex(blob), layer.digest().digest());
+                assert_eq!(blob.len() as u64, layer.size());
+            }
         }
     }
 }
@@ -1203,7 +1266,7 @@ mod integration_tests {
     /// network access.
     #[tokio::test]
     #[ignore = "network required"]
-    async fn pulls_a_real_multi_layer_base() {
+    async fn pulls_multi_layer_base() {
         let reference = "docker.io/library/nginx:alpine";
         let base_image = pull_base(reference).await.expect("pull {reference}");
 
