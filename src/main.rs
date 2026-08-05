@@ -11,14 +11,19 @@ mod tailscale;
 mod templates;
 mod util;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 use app::App;
-use cli::Cli;
+use cli::{Cli, Command};
 
 #[tokio::main]
 async fn main() {
-    let command = Cli::parse().command;
+    let cli = Cli::parse();
+    if let Command::Completions { shell } = cli.command {
+        clap_complete::generate(shell, &mut Cli::command(), "lilbox", &mut std::io::stdout());
+        std::process::exit(0);
+    }
+    let command = cli.command;
     let code = match App::new() {
         Ok(app) => match commands::dispatch(&app, command).await {
             Ok(code) => code,

@@ -40,6 +40,11 @@ pub(crate) async fn dispatch(app: &App, command: Command) -> Result<i32> {
         Command::Url { name } => net::url(app, name)?,
         Command::Agent(args) => return agent::cmd_agent(app, args).await,
         Command::Doctor => view::doctor(app)?,
+        // Handled in main() before App::new() so completion generation never
+        // initializes user state; do not move this into dispatch.
+        Command::Completions { .. } => {
+            unreachable!("completions is handled in main before App init")
+        }
     }
     Ok(0)
 }

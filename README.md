@@ -65,6 +65,22 @@ lilbox doctor               # verify the runtime
 
 For development, use `cargo run -- <command>`.
 
+### Shell completions
+
+`lilbox completions <shell>` prints a completion script to stdout for `bash`,
+`zsh`, `fish`, `elvish`, or `powershell`. Source it from your shell rc:
+
+```bash
+# bash — ~/.bashrc
+eval "$(lilbox completions bash)"
+
+# zsh — ~/.zshrc (or drop into a dir on $fpath as _lilbox)
+eval "$(lilbox completions zsh)"
+
+# fish
+lilbox completions fish | source
+```
+
 ## Where lilbox keeps its state
 
 `lilbox` follows the XDG base directory layout (via the `dirs` crate, so it's

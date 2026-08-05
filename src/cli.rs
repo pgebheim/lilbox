@@ -85,6 +85,11 @@ pub(crate) enum Command {
     Agent(AgentArgs),
     /// Check the local runtime and Tailscale installation.
     Doctor,
+    /// Generate a shell completion script.
+    Completions {
+        /// Shell to generate completions for.
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Args)]
