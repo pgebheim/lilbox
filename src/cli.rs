@@ -223,6 +223,9 @@ pub(crate) struct AgentArgs {
     pub(crate) key_env: String,
     #[arg(long, default_value = "api.anthropic.com")]
     pub(crate) key_host: String,
+    /// Don't inherit the host's Claude login into the box; fall back to ANTHROPIC_API_KEY injection.
+    #[arg(long)]
+    pub(crate) no_claude_config: bool,
     #[arg(last = true)]
     pub(crate) task: Vec<String>,
 }
