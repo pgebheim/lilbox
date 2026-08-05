@@ -312,13 +312,15 @@ them; lilbox isolates but has no multiplexer.
 worktree its own microVM and destroys it with the worktree.
 
 ```bash
-herdr plugin install pgebheim/lilbox/contrib/herdr
+herdr plugin install pgebheim/lilbox/contrib/herdr   # on the lilbox host
 herdr plugin action invoke lilbox.agent    # boot this worktree's box, run the agent in it
 ```
 
 Every other sandbox-backed herdr plugin delegates isolation to someone else's
 cloud. This one runs on your hardware and bind-mounts the live worktree instead
-of shuttling snapshots. See [`contrib/herdr/README.md`](contrib/herdr/README.md).
+of shuttling snapshots. Install it on the **lilbox host**, not a `herdr --remote`
+or Herdr Mirror client — see
+[`contrib/herdr/README.md`](contrib/herdr/README.md) for the topology and config.
 
 ## Configuration
 

@@ -19,7 +19,31 @@ worktree instead of shuttling snapshots, and costs nothing per hour.
 - herdr **0.7.0+**
 - `jq` — herdr hands plugins their context as JSON
 
+## Where to install it (host, not a remote client)
+
+The plugin needs KVM and the `lilbox` binary, so it installs on the herdr
+instance **co-located with lilbox** — the Linux/KVM host. This is easy to get
+wrong when you drive herdr from another machine:
+
+- **`herdr --remote` (thin client).** One herdr *server*, and it's the remote
+  (Linux) one; your local terminal just streams its UI. Plugins already run
+  server-side, so install here — on the host.
+- **Herdr Mirror.** Two *independent* herdr servers. `herdr-mirror` lives on
+  your **local** machine and only SSH-drives the remote (*"the remote needs no
+  plugin — just herdr"*). The lilbox plugin is an ordinary remote-side plugin:
+  install it on the **remote Linux host's** herdr, and Mirror just projects the
+  box pane into your local sidebar. Do **not** install it on the Mirror client
+  — no KVM there, and it would find no lilbox state.
+
+Either way, lilbox's keys never cross the boundary. Everything sensitive —
+`~/.config/lilbox/config.toml`, Tailscale OAuth / auth keys, the
+`ANTHROPIC_API_KEY` the agent pane injects, box SSH — stays on the host where
+`lilbox` runs. A remote/Mirror client only ever holds the SSH credential to
+reach that host, which it needs regardless of this plugin.
+
 ## Install
+
+Run this on the host (see above):
 
 ```bash
 herdr plugin install pgebheim/lilbox/contrib/herdr
