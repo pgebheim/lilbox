@@ -109,6 +109,12 @@ pub(crate) enum ImageCommand {
         #[arg(long)]
         tag: String,
     },
+    /// Pull a base image, append a Tailscale layer, and load it under a new tag.
+    Tailscalify {
+        base: String,
+        #[arg(long)]
+        tag: String,
+    },
 }
 
 #[derive(Args)]

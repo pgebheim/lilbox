@@ -5,7 +5,11 @@
 //! [`microsandbox::Image::load`] can ingest directly. No local Docker daemon
 //! is involved anywhere in this path.
 
-use std::{collections::HashMap, io::Write, path::Path};
+use std::{
+    collections::HashMap,
+    io::{Read, Write},
+    path::Path,
+};
 
 use anyhow::{Context, Result, anyhow};
 use flate2::{Compression, write::GzEncoder};
@@ -20,7 +24,7 @@ use oci_client::{
     secrets::RegistryAuth,
 };
 use oci_spec::image::{
-    Descriptor, DescriptorBuilder, Digest as OciDigest, HistoryBuilder, ImageConfiguration,
+    Arch, Descriptor, DescriptorBuilder, Digest as OciDigest, HistoryBuilder, ImageConfiguration,
     ImageIndexBuilder, ImageManifest, MediaType, OciLayoutBuilder,
 };
 use sha2::{Digest as Sha2Digest, Sha256};
@@ -28,6 +32,24 @@ use sha2::{Digest as Sha2Digest, Sha256};
 use crate::util::now;
 
 const OCI_REF_NAME_ANNOTATION: &str = "org.opencontainers.image.ref.name";
+
+/// Tailscale release to fetch for the `tailscalify` overlay layer.
+const TAILSCALE_VERSION: &str = "1.102.2";
+
+/// Pinned SHA-256 of each `TAILSCALE_VERSION` release tarball (from
+/// `pkgs.tailscale.com/stable/tailscale_<ver>_<arch>.tgz.sha256`). The
+/// download is verified against this before its binaries are unpacked into a
+/// layer that runs as root in the guest — HTTPS authenticates the host, this
+/// pins the exact artifact. Bump both when `TAILSCALE_VERSION` changes.
+const TAILSCALE_SHA256_AMD64: &str =
+    "ad2cde12f8de95f7b93a1e0401e652291c603d42b9d60a33fb1741eb38ab04d8";
+const TAILSCALE_SHA256_ARM64: &str =
+    "2b64e9ade7e73034b5ec9e9bcd537f5ddd14ae3abb435e57e929e7486ae42660";
+
+/// The canonical lilbox-box first-boot bring-up hook, embedded so the
+/// tailscalified image and the reference `images/lilbox-box` build share a
+/// single source of truth.
+const LILBOX_BOOT: &str = include_str!("../images/lilbox-box/lilbox-boot");
 
 /// A base image pulled from a registry: its raw manifest/config JSON plus
 /// every layer blob (bottom-to-top), keyed by their compressed digest hex.
@@ -100,14 +122,14 @@ pub(crate) async fn pull_base(reference: &str) -> Result<BaseImage> {
 /// uncompressed tar>` (the identity recorded in the image config's
 /// `rootfs.diff_ids`). The two are intentionally different digests over
 /// different content.
-pub(crate) fn build_layer(files: &[(String, Vec<u8>)]) -> Result<(Vec<u8>, String, String)> {
+pub(crate) fn build_layer(files: &[(String, Vec<u8>, u32)]) -> Result<(Vec<u8>, String, String)> {
     let mut tar_bytes = Vec::new();
     {
         let mut builder = tar::Builder::new(&mut tar_bytes);
-        for (path, data) in files {
+        for (path, data, mode) in files {
             let mut header = tar::Header::new_gnu();
             header.set_size(data.len() as u64);
-            header.set_mode(0o644);
+            header.set_mode(*mode);
             header.set_mtime(0);
             header.set_cksum();
             builder
@@ -250,8 +272,18 @@ pub(crate) fn write_oci_archive(
     Ok(())
 }
 
-/// Pull `base`, append a single new layer containing `extra_files`, write a
-/// standard OCI image-layout tar, and load it into microsandbox as `tag`.
+/// A single new layer ready to be appended onto a [`BaseImage`]: its gzip
+/// blob plus the compressed (`digest`) and uncompressed (`diff_id`) digests
+/// produced by [`build_layer`].
+pub(crate) struct BuiltLayer {
+    pub(crate) gzip: Vec<u8>,
+    pub(crate) digest: String,
+    pub(crate) diff_id: String,
+}
+
+/// Pull `base`, append a single new layer containing `extra_files` (each
+/// written with mode `0o644`), write a standard OCI image-layout tar, and
+/// load it into microsandbox as `tag`.
 pub(crate) async fn overlay_image(
     base: &str,
     extra_files: &[(String, Vec<u8>)],
@@ -259,20 +291,38 @@ pub(crate) async fn overlay_image(
 ) -> Result<()> {
     let base_image = pull_base(base).await?;
 
-    let (layer_gzip, layer_digest, diff_id) = build_layer(extra_files)?;
-    let (new_config_bytes, config_digest) =
-        append_layer_to_config(&base_image.config_bytes, &diff_id)?;
+    let files: Vec<(String, Vec<u8>, u32)> = extra_files
+        .iter()
+        .map(|(path, data)| (path.clone(), data.clone(), 0o644))
+        .collect();
+    let (gzip, digest, diff_id) = build_layer(&files)?;
 
-    let layer_descriptor = DescriptorBuilder::default()
-        .media_type(MediaType::ImageLayerGzip)
-        .digest(
-            layer_digest
-                .parse::<OciDigest>()
-                .map_err(|e| anyhow!("parsing layer digest '{layer_digest}': {e}"))?,
-        )
-        .size(layer_gzip.len() as u64)
-        .build()
-        .map_err(|e| anyhow!("building layer descriptor: {e}"))?;
+    assemble_and_load(
+        base_image,
+        vec![BuiltLayer {
+            gzip,
+            digest,
+            diff_id,
+        }],
+        tag,
+    )
+    .await
+}
+
+/// Given a pulled `base` and one or more `new_layers` built by
+/// [`build_layer`], rewrite the base's config and manifest to append every
+/// new layer, write the resulting OCI image-layout tar, and load it into
+/// microsandbox as `tag`. Shared assembly tail for [`overlay_image`] and
+/// [`tailscalify_image`].
+async fn assemble_and_load(base: BaseImage, new_layers: Vec<BuiltLayer>, tag: &str) -> Result<()> {
+    let mut config_bytes = base.config_bytes;
+    let mut config_digest = String::new();
+    for layer in &new_layers {
+        let (new_config_bytes, digest) = append_layer_to_config(&config_bytes, &layer.diff_id)?;
+        config_bytes = new_config_bytes;
+        config_digest = digest;
+    }
+
     let config_descriptor = DescriptorBuilder::default()
         .media_type(MediaType::ImageConfig)
         .digest(
@@ -280,18 +330,35 @@ pub(crate) async fn overlay_image(
                 .parse::<OciDigest>()
                 .map_err(|e| anyhow!("parsing config digest '{config_digest}': {e}"))?,
         )
-        .size(new_config_bytes.len() as u64)
+        .size(config_bytes.len() as u64)
         .build()
         .map_err(|e| anyhow!("building config descriptor: {e}"))?;
 
-    let (new_manifest_bytes, manifest_digest) = append_layer_to_manifest(
-        &base_image.manifest_bytes,
-        layer_descriptor,
-        config_descriptor,
-    )?;
+    let mut manifest_bytes = base.manifest_bytes;
+    let mut manifest_digest = String::new();
+    for layer in &new_layers {
+        let layer_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageLayerGzip)
+            .digest(
+                layer
+                    .digest
+                    .parse::<OciDigest>()
+                    .map_err(|e| anyhow!("parsing layer digest '{}': {e}", layer.digest))?,
+            )
+            .size(layer.gzip.len() as u64)
+            .build()
+            .map_err(|e| anyhow!("building layer descriptor: {e}"))?;
 
-    let mut layer_blobs = base_image.layer_blobs;
-    layer_blobs.push((strip_sha256(&layer_digest)?.to_string(), layer_gzip));
+        let (new_manifest_bytes, digest) =
+            append_layer_to_manifest(&manifest_bytes, layer_descriptor, config_descriptor.clone())?;
+        manifest_bytes = new_manifest_bytes;
+        manifest_digest = digest;
+    }
+
+    let mut layer_blobs = base.layer_blobs;
+    for layer in new_layers {
+        layer_blobs.push((strip_sha256(&layer.digest)?.to_string(), layer.gzip));
+    }
 
     let tmp_path = std::env::temp_dir().join(format!(
         "lilbox-overlay-{}-{}.tar",
@@ -301,9 +368,9 @@ pub(crate) async fn overlay_image(
 
     if let Err(err) = write_oci_archive(
         &tmp_path,
-        &new_config_bytes,
+        &config_bytes,
         &config_digest,
-        &new_manifest_bytes,
+        &manifest_bytes,
         &manifest_digest,
         &layer_blobs,
         tag,
@@ -316,6 +383,146 @@ pub(crate) async fn overlay_image(
     let _ = std::fs::remove_file(&tmp_path);
     loaded?;
     Ok(())
+}
+
+/// Determine the Tailscale arch string (`amd64`/`arm64`) for the given OCI
+/// [`Arch`]. Bails on architectures Tailscale packages don't ship or that
+/// this overlay doesn't support yet.
+fn tailscale_arch_string(arch: &Arch) -> Result<&'static str> {
+    match arch {
+        Arch::Amd64 => Ok("amd64"),
+        Arch::ARM64 => Ok("arm64"),
+        other => Err(anyhow!(
+            "unsupported base image architecture '{other}' for tailscale overlay (only amd64/arm64 are supported)"
+        )),
+    }
+}
+
+/// Extract `tailscale`/`tailscaled` from a Tailscale release `.tgz` and pair
+/// them with the embedded `lilbox-boot` hook. Pure: no I/O beyond decoding
+/// `tarball_gz` in memory. Returns `(path, bytes, mode)` triples, all mode
+/// `0o755`.
+fn tailscale_layer_files(
+    tarball_gz: &[u8],
+    version: &str,
+    arch: &str,
+) -> Result<Vec<(String, Vec<u8>, u32)>> {
+    let mut decoder = flate2::read::GzDecoder::new(tarball_gz);
+    let mut tar_bytes = Vec::new();
+    decoder
+        .read_to_end(&mut tar_bytes)
+        .context("gunzipping tailscale release tarball")?;
+
+    let prefix = format!("tailscale_{version}_{arch}/");
+    let tailscale_path = format!("{prefix}tailscale");
+    let tailscaled_path = format!("{prefix}tailscaled");
+
+    let mut tailscale_bin: Option<Vec<u8>> = None;
+    let mut tailscaled_bin: Option<Vec<u8>> = None;
+
+    let mut archive = tar::Archive::new(tar_bytes.as_slice());
+    for entry in archive
+        .entries()
+        .context("reading tailscale release tarball entries")?
+    {
+        let mut entry = entry.context("reading a tailscale release tarball entry")?;
+        let entry_path = entry.path()?.to_string_lossy().into_owned();
+        if entry_path == tailscale_path {
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data)?;
+            tailscale_bin = Some(data);
+        } else if entry_path == tailscaled_path {
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data)?;
+            tailscaled_bin = Some(data);
+        }
+    }
+
+    let tailscaled_bin = tailscaled_bin.ok_or_else(|| {
+        anyhow!("tailscale release tarball is missing expected binary '{tailscaled_path}'")
+    })?;
+    let tailscale_bin = tailscale_bin.ok_or_else(|| {
+        anyhow!("tailscale release tarball is missing expected binary '{tailscale_path}'")
+    })?;
+
+    Ok(vec![
+        (
+            "usr/local/bin/tailscaled".to_string(),
+            tailscaled_bin,
+            0o755,
+        ),
+        ("usr/local/bin/tailscale".to_string(), tailscale_bin, 0o755),
+        (
+            "usr/local/bin/lilbox-boot".to_string(),
+            LILBOX_BOOT.as_bytes().to_vec(),
+            0o755,
+        ),
+    ])
+}
+
+/// Download a Tailscale release tarball for `arch` from the stable channel.
+async fn download_tailscale(arch: &str, version: &str) -> Result<Vec<u8>> {
+    let url = format!("https://pkgs.tailscale.com/stable/tailscale_{version}_{arch}.tgz");
+    let response = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("downloading tailscale from '{url}'"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!(
+            "downloading tailscale from '{url}' failed: {status}"
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("reading tailscale download body from '{url}'"))?
+        .to_vec();
+    // Verify the download against the pinned digest before we unpack a binary
+    // that will run as root in the guest.
+    let expected = match arch {
+        "amd64" => TAILSCALE_SHA256_AMD64,
+        "arm64" => TAILSCALE_SHA256_ARM64,
+        other => return Err(anyhow!("no pinned tailscale checksum for arch '{other}'")),
+    };
+    let actual = sha256_hex(&bytes);
+    if actual != expected {
+        return Err(anyhow!(
+            "tailscale download from '{url}' failed checksum verification (expected {expected}, got {actual})"
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Pull `base`, append a Tailscale layer (`tailscaled`, `tailscale`, and the
+/// `lilbox-boot` bring-up hook), write a standard OCI image-layout tar, and
+/// load it into microsandbox as `tag` -- producing a tailnet-capable image
+/// from any base.
+pub(crate) async fn tailscalify_image(base: &str, tag: &str) -> Result<()> {
+    let base_image = pull_base(base).await?;
+
+    let arch = serde_json::from_slice::<ImageConfiguration>(&base_image.config_bytes)
+        .context("parsing base image config to read its architecture")?
+        .architecture()
+        .clone();
+    let tailscale_arch = tailscale_arch_string(&arch)?;
+
+    println!("downloading tailscale {TAILSCALE_VERSION} ({tailscale_arch})...");
+    let tarball = download_tailscale(tailscale_arch, TAILSCALE_VERSION).await?;
+    let files = tailscale_layer_files(&tarball, TAILSCALE_VERSION, tailscale_arch)?;
+    let (gzip, digest, diff_id) = build_layer(&files)?;
+
+    assemble_and_load(
+        base_image,
+        vec![BuiltLayer {
+            gzip,
+            digest,
+            diff_id,
+        }],
+        tag,
+    )
+    .await
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -401,7 +608,7 @@ mod tests {
 
     #[test]
     fn build_layer_computes_distinct_deterministic_digests() {
-        let files = vec![("etc/lilbox-overlay".to_string(), b"v1\n".to_vec())];
+        let files = vec![("etc/lilbox-overlay".to_string(), b"v1\n".to_vec(), 0o644u32)];
 
         let (gzip_a, layer_digest_a, diff_id_a) = build_layer(&files).unwrap();
         let (gzip_b, layer_digest_b, diff_id_b) = build_layer(&files).unwrap();
@@ -426,6 +633,115 @@ mod tests {
 
         // layer_digest must equal the sha256 of the COMPRESSED (gzip) bytes.
         assert_eq!(layer_digest_a, format!("sha256:{}", sha256_hex(&gzip_a)));
+
+        // The per-file mode passed to build_layer is honored in the tar header.
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let entry = archive.entries().unwrap().next().unwrap().unwrap();
+        assert_eq!(entry.header().mode().unwrap(), 0o644);
+    }
+
+    #[test]
+    fn build_layer_honors_executable_mode() {
+        let files = vec![(
+            "usr/local/bin/tailscale".to_string(),
+            b"bin".to_vec(),
+            0o755u32,
+        )];
+
+        let (gzip, _, _) = build_layer(&files).unwrap();
+        let mut decoder = flate2::read::GzDecoder::new(gzip.as_slice());
+        let mut tar_bytes = Vec::new();
+        decoder.read_to_end(&mut tar_bytes).unwrap();
+
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let entry = archive.entries().unwrap().next().unwrap().unwrap();
+        assert_eq!(entry.header().mode().unwrap(), 0o755);
+    }
+
+    fn synthetic_tailscale_tarball(version: &str, arch: &str) -> Vec<u8> {
+        let prefix = format!("tailscale_{version}_{arch}");
+        let files = vec![
+            (
+                format!("{prefix}/tailscale"),
+                b"fake tailscale binary".to_vec(),
+            ),
+            (
+                format!("{prefix}/tailscaled"),
+                b"fake tailscaled binary".to_vec(),
+            ),
+            (format!("{prefix}/README"), b"not a binary".to_vec()),
+        ];
+
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            for (path, data) in &files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o755);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, path, data.as_slice())
+                    .unwrap();
+            }
+            builder.finish().unwrap();
+        }
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn tailscale_layer_files_extracts_binaries_and_boot_hook() {
+        let version = "1.102.2";
+        let arch = "amd64";
+        let tarball_gz = synthetic_tailscale_tarball(version, arch);
+
+        let files = tailscale_layer_files(&tarball_gz, version, arch).unwrap();
+        let by_path: HashMap<String, (Vec<u8>, u32)> = files
+            .into_iter()
+            .map(|(path, data, mode)| (path, (data, mode)))
+            .collect();
+
+        let (tailscaled_data, tailscaled_mode) = by_path.get("usr/local/bin/tailscaled").unwrap();
+        assert_eq!(tailscaled_data, b"fake tailscaled binary");
+        assert_eq!(*tailscaled_mode, 0o755);
+
+        let (tailscale_data, tailscale_mode) = by_path.get("usr/local/bin/tailscale").unwrap();
+        assert_eq!(tailscale_data, b"fake tailscale binary");
+        assert_eq!(*tailscale_mode, 0o755);
+
+        let (boot_data, boot_mode) = by_path.get("usr/local/bin/lilbox-boot").unwrap();
+        assert_eq!(std::str::from_utf8(boot_data).unwrap(), LILBOX_BOOT);
+        assert_eq!(*boot_mode, 0o755);
+    }
+
+    #[test]
+    fn tailscale_layer_files_errors_when_binary_missing() {
+        let version = "1.102.2";
+        let arch = "amd64";
+        let prefix = format!("tailscale_{version}_{arch}");
+
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let data = b"fake tailscale binary".to_vec();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("{prefix}/tailscale"), data.as_slice())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_bytes).unwrap();
+        let tarball_gz = encoder.finish().unwrap();
+
+        let err = tailscale_layer_files(&tarball_gz, version, arch).unwrap_err();
+        assert!(err.to_string().contains("tailscaled"));
     }
 
     #[test]
@@ -643,7 +959,7 @@ mod integration_tests {
             .await
             .expect("pull docker.io/library/alpine:latest");
 
-        let extra_files = vec![("etc/lilbox-overlay".to_string(), b"v1\n".to_vec())];
+        let extra_files = vec![("etc/lilbox-overlay".to_string(), b"v1\n".to_vec(), 0o644u32)];
         let (layer_gzip, layer_digest, diff_id) = build_layer(&extra_files).unwrap();
         let (new_config_bytes, config_digest) =
             append_layer_to_config(&base_image.config_bytes, &diff_id).unwrap();
@@ -715,5 +1031,35 @@ mod integration_tests {
         let load_result = microsandbox::Image::load(&tmp, vec![tag.to_string()]).await;
         let _ = std::fs::remove_file(&tmp);
         load_result.expect("microsandbox::Image::load should ingest the overlaid archive");
+    }
+
+    /// Builds a real tailnet-capable image from a real base: pulls alpine,
+    /// downloads a real Tailscale release, and structurally verifies the
+    /// extracted layer contains a `usr/local/bin/tailscaled` entry before
+    /// exercising the full `tailscalify_image` pipeline (which itself calls
+    /// `Image::load`). Ignored by default: needs network access for both the
+    /// registry pull and the Tailscale download, and a working microsandbox
+    /// runtime for the final load.
+    #[tokio::test]
+    #[ignore = "network + microsandbox runtime required"]
+    async fn tailscalifies_alpine() {
+        let host_arch = tailscale_arch_string(&Arch::default())
+            .expect("host architecture should be amd64 or arm64");
+        let tarball = download_tailscale(host_arch, TAILSCALE_VERSION)
+            .await
+            .expect("downloading a real tailscale release");
+        let files = tailscale_layer_files(&tarball, TAILSCALE_VERSION, host_arch)
+            .expect("extracting tailscale/tailscaled from the real release tarball");
+        assert!(
+            files
+                .iter()
+                .any(|(path, _, mode)| path == "usr/local/bin/tailscaled" && *mode == 0o755),
+            "extracted layer should contain an executable usr/local/bin/tailscaled entry"
+        );
+
+        let tag = "lilbox/tailnet-test";
+        tailscalify_image("docker.io/library/alpine:latest", tag)
+            .await
+            .expect("tailscalify_image should succeed against a real alpine base");
     }
 }
