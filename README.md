@@ -86,7 +86,7 @@ lilbox run -- python3 -c 'print("ran in a throwaway microVM")'
 
 | Command | Does |
 |---|---|
-| `lilbox new [NAME] [--template T] [--image I] [--port P] [--cpus N] [--memory M] [--rebuild] [--no-persist] [--volume V] [--ttl D] [--idle-timeout D]` | Boot a persistent box (default image `python`, guest port `8000`, persistent `/root` home) |
+| `lilbox new [NAME] [--template T] [--image I] [--port P] [--cpus N] [--memory M] [--rebuild] [--tailnet] [--tailnet-tag TAG] [--no-persist] [--volume V] [--ttl D] [--idle-timeout D]` | Boot a persistent box (default image `python`, guest port `8000`, persistent `/root` home; isolated by default — pass `--tailnet` (or `--tailnet-tag`) to join the tailnet) |
 | `lilbox templates` | List available box templates |
 | `lilbox provision NAME` | Re-run a box's template setup script |
 | `lilbox ls [--json]` | List boxes with live status + published URLs (`--json` for scripting) |
@@ -167,6 +167,35 @@ lilbox exec mybox -- tailscale version  # tailscale is baked in
 
 See [`images/lilbox-box/README.md`](images/lilbox-box/README.md) for details.
 
+### `--tailnet`: opt-in tailnet identity on any image
+
+`lilbox new` is **isolation-only by default** — a box never joins your
+tailnet just because a credential happens to be sitting in the environment.
+Joining is opt-in: pass `--tailnet`, or `--tailnet-tag TAG` (a specific ACL
+tag, which implies `--tailnet` on its own), or set `[tailscale] auto = true`
+in config for "always join". This supersedes an earlier design where a key
+alone in the environment silently triggered a join.
+
+You don't need `lilbox-box` (or a Dockerfile) to get a tailnet-joined box.
+When tailnet join is requested and resolves a credential (see below), and the
+chosen image isn't already tailnet-capable, `lilbox new` auto-builds a
+tailscalified variant of that base via the same docker-free OCI overlay used
+by `lilbox image tailscalify` — no local Docker daemon involved. The result
+is cached under a tag keyed by the base image and the pinned Tailscale
+version (`lilbox/tailnet/<base>-ts<version>`), so the first `lilbox new
+--tailnet` against a given base is slower (pulls the base, downloads
+Tailscale, builds the overlay) and every repeat is instant. Pass `--rebuild`
+to refresh the cached overlay. If the build fails, `lilbox new` warns and
+falls back to booting the base image as-is — it never fails because of it.
+This means tailnet identity works on any template, not just `lilbox-box`,
+with a single flag.
+
+If you ask for `--tailnet` (or `--tailnet-tag`) but no credential resolves,
+`lilbox new` prints a note and boots a plain, un-joined box rather than
+failing. Conversely, if you don't pass `--tailnet` but the resolved image
+already happens to be tailnet-capable (e.g. `--image lilbox-box`), `lilbox
+new` prints a note reminding you that `--tailnet` is what actually joins it.
+
 ## Tailnet ACLs
 
 Boxes join the tailnet tagged `tag:lilbox-vm`. Before boxes can join and be
@@ -189,8 +218,9 @@ removed from the tailnet immediately rather than waiting for it to age out.
 
 ### Joining the tailnet: OAuth-minted keys vs. a static auth key
 
-`lilbox new` can join a box to the tailnet two ways, configured under
-`[tailscale]` in `~/.config/lilbox/config.toml`:
+Once tailnet join is requested (`--tailnet`, `--tailnet-tag`, or
+`[tailscale] auto = true`), `lilbox new` can resolve a credential two ways,
+configured under `[tailscale]` in `~/.config/lilbox/config.toml`:
 
 ```toml
 [tailscale]
@@ -198,6 +228,7 @@ tag = "tag:lilbox-vm"                       # optional, defaults to tag:lilbox-v
 oauthClientId = "k123abc..."                 # Tailscale OAuth client ID
 oauthClientSecretEnv = "TS_OAUTH_CLIENT_SECRET"  # optional, this is the default
 # authKeyEnv = "TS_AUTHKEY"                  # static fallback, see below
+# auto = true                                # optional: imply --tailnet on every `lilbox new`
 ```
 
 - **`oauthClientId` (preferred).** `lilbox new` mints a fresh, tagged,
@@ -228,28 +259,34 @@ these) so the guest's momentary visibility of its own key is moot.
 
 ## Quickstart: a box on your tailnet
 
-Prereqs (once): the [Tailnet ACLs](#tailnet-acls) in place, a Tailscale
-credential, and the [`lilbox-box`](#boxes-with-tailscale-baked-in-lilbox-box)
-image (the default `python` image has no `tailscaled`).
+Prereqs (once): the [Tailnet ACLs](#tailnet-acls) in place and a Tailscale
+credential. Any image works — pass `--tailnet` and `lilbox new`
+[auto-builds a tailnet-capable
+variant](#--tailnet-opt-in-tailnet-identity-on-any-image) of whatever base
+you pick (cached after the first run).
 
-1. Build the image: `images/lilbox-box/build.sh`
-2. Pick a credential — OAuth (recommended: mints a fresh, 5-minute key per
+1. Pick a credential — OAuth (recommended: mints a fresh, 5-minute key per
    box) via `oauthClientId` in `[tailscale]` plus
    `export TS_OAUTH_CLIENT_SECRET=...`; or a static, ephemeral,
    pre-authorized `tag:lilbox-vm` key via `export TS_AUTHKEY=tskey-auth-...`.
    See [OAuth-minted keys vs. a static auth
    key](#joining-the-tailnet-oauth-minted-keys-vs-a-static-auth-key) for the
    tradeoffs.
-3. `lilbox new dev --image lilbox-box`
-4. Use it:
+2. `lilbox new dev --tailnet` — the first run builds and caches a
+   tailscalified image; repeats (with the same base) are instant. (Set
+   `[tailscale] auto = true` if you want every `lilbox new` to join without
+   passing the flag.)
+3. Use it:
    - `lilbox url dev` → `https://dev.<tailnet>.ts.net/`, serving the app on
      guest port 8000
    - `lilbox ssh dev` — Tailscale SSH, keyless
-5. `lilbox rm dev` — deregisters the node.
+4. `lilbox rm dev` — deregisters the node.
 
-Troubleshooting: a `could not join tailnet` warning is almost always the
-image (it must be tailscaled-capable — use `lilbox-box`) or a missing/rejected
-credential.
+Troubleshooting: a `could not join tailnet` warning is almost always a
+missing/rejected credential, or an auto-tailscalify build failure (printed as
+a separate warning; `lilbox new` still boots the base image, just without a
+tailnet join). A plain `lilbox new` (no `--tailnet`/`--tailnet-tag`/`auto`)
+never attempts a join, even if a credential is present in the environment.
 
 ## Persistent volumes (devboxes)
 

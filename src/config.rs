@@ -23,6 +23,9 @@ pub(crate) struct TailscaleConfig {
     pub(crate) oauth_client_id: Option<String>,
     #[serde(rename = "oauthClientSecretEnv")]
     pub(crate) oauth_client_secret_env: Option<String>,
+    /// When `true`, `lilbox new` behaves as if `--tailnet` were always passed.
+    #[serde(default)]
+    pub(crate) auto: Option<bool>,
 }
 
 #[cfg(test)]
@@ -40,7 +43,7 @@ mod tests {
     #[test]
     fn parses_tailscale_table() {
         let config: Config = toml::from_str(
-            "[tailscale]\ntag = 'tag:custom'\nauthKeyEnv = 'MY_KEY'\noauthClientId = 'client-123'\noauthClientSecretEnv = 'MY_SECRET'\n",
+            "[tailscale]\ntag = 'tag:custom'\nauthKeyEnv = 'MY_KEY'\noauthClientId = 'client-123'\noauthClientSecretEnv = 'MY_SECRET'\nauto = true\n",
         )
         .unwrap();
         assert_eq!(config.tailscale.tag.as_deref(), Some("tag:custom"));
@@ -53,6 +56,7 @@ mod tests {
             config.tailscale.oauth_client_secret_env.as_deref(),
             Some("MY_SECRET")
         );
+        assert_eq!(config.tailscale.auto, Some(true));
     }
 
     #[test]
@@ -62,5 +66,6 @@ mod tests {
         assert!(config.tailscale.auth_key_env.is_none());
         assert!(config.tailscale.oauth_client_id.is_none());
         assert!(config.tailscale.oauth_client_secret_env.is_none());
+        assert!(config.tailscale.auto.is_none());
     }
 }

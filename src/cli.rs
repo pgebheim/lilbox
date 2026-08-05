@@ -163,8 +163,13 @@ pub(crate) struct NewArgs {
     #[arg(long)]
     pub(crate) idle_timeout: Option<String>,
     /// Tailnet ACL tag to advertise when joining (default: tag:lilbox-vm).
+    /// Implies --tailnet.
     #[arg(long)]
-    pub(crate) tag: Option<String>,
+    pub(crate) tailnet_tag: Option<String>,
+    /// Join the tailnet (auto-builds a cached tailnet-capable variant of the
+    /// image if needed). Implied by --tailnet-tag, or by [tailscale] auto = true.
+    #[arg(long)]
+    pub(crate) tailnet: bool,
 }
 
 #[derive(Args)]

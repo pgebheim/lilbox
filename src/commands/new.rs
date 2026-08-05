@@ -6,12 +6,13 @@ use rusqlite::params;
 
 use crate::app::App;
 use crate::cli::NewArgs;
+use crate::overlay;
 use crate::provision::{build_template_image, provision};
 use crate::sandbox::{SandboxSettings, configure_builder};
 use crate::tailscale::{
     DEFAULT_AUTH_KEY_ENV, JoinMode, is_valid_env_var_name, join_failure_detail, mint_ephemeral_key,
     node_hostname, require_auth_key, resolve_join_mode, resolve_tag, tailscale_up_command,
-    validate_tag,
+    validate_tag, wants_tailnet,
 };
 use crate::util::{
     DEFAULT_GUEST_PORT, DEFAULT_IMAGE, alloc_host_port, now, parse_duration, parse_memory,
@@ -27,57 +28,74 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
         bail!("box '{name}' already exists");
     }
     let config = app.config()?;
-    let mut tag = resolve_tag(args.tag.as_deref(), config.tailscale.tag.as_deref());
-    let mode = resolve_join_mode(&config.tailscale, args.tag.as_deref(), |name| {
-        env::var(name).ok()
-    });
+    let mut tag = resolve_tag(args.tailnet_tag.as_deref(), config.tailscale.tag.as_deref());
+    // Tailnet join is opt-in: a key alone in the environment no longer
+    // triggers anything. It fires only on explicit intent (--tailnet,
+    // --tailnet-tag, or [tailscale] auto = true) plus a resolvable credential.
+    let want_tailnet = wants_tailnet(
+        args.tailnet,
+        args.tailnet_tag.as_deref(),
+        config.tailscale.auto,
+    );
     let mut key_env = DEFAULT_AUTH_KEY_ENV.to_string();
     let mut minted_key: Option<String> = None;
-    let joins_tailnet = match mode {
-        JoinMode::Mint {
-            tag: mint_tag,
-            client_id,
-            client_secret,
-        } => {
-            tag = mint_tag;
-            // A malformed tag from config must not abort `new` (never fail on a
-            // tailnet problem) — warn and skip the join. An explicit --tag is
-            // still hard-validated below for fast feedback.
-            if let Err(error) = validate_tag(&tag) {
-                eprintln!("warning: {error}; skipping tailnet join");
-                false
-            } else {
-                match mint_ephemeral_key(&client_id, &client_secret, &tag, &name).await {
-                    Ok(key) => {
-                        minted_key = Some(key);
-                        true
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "warning: could not mint tailnet auth key: {error}; skipping tailnet join"
-                        );
-                        false
+    let mut joins_tailnet = false;
+    if want_tailnet {
+        let mode = resolve_join_mode(&config.tailscale, args.tailnet_tag.as_deref(), |name| {
+            env::var(name).ok()
+        });
+        joins_tailnet = match mode {
+            JoinMode::Mint {
+                tag: mint_tag,
+                client_id,
+                client_secret,
+            } => {
+                tag = mint_tag;
+                // A malformed tag from config must not abort `new` (never fail on a
+                // tailnet problem) — warn and skip the join. An explicit --tailnet-tag
+                // is still hard-validated below for fast feedback.
+                if let Err(error) = validate_tag(&tag) {
+                    eprintln!("warning: {error}; skipping tailnet join");
+                    false
+                } else {
+                    match mint_ephemeral_key(&client_id, &client_secret, &tag, &name).await {
+                        Ok(key) => {
+                            minted_key = Some(key);
+                            true
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "warning: could not mint tailnet auth key: {error}; skipping tailnet join"
+                            );
+                            false
+                        }
                     }
                 }
             }
-        }
-        JoinMode::StaticEnv { key_env: env_name } => {
-            key_env = env_name;
-            if !is_valid_env_var_name(&key_env) {
+            JoinMode::StaticEnv { key_env: env_name } => {
+                key_env = env_name;
+                if !is_valid_env_var_name(&key_env) {
+                    eprintln!(
+                        "warning: tailscale authKeyEnv '{key_env}' is not a valid environment variable name; skipping tailnet join"
+                    );
+                    false
+                } else {
+                    require_auth_key(env::var(&key_env).ok(), &key_env).is_ok()
+                }
+            }
+            JoinMode::Skip => {
                 eprintln!(
-                    "warning: tailscale authKeyEnv '{key_env}' is not a valid environment variable name; skipping tailnet join"
+                    "note: --tailnet requested but no auth key set (TS_AUTHKEY / [tailscale] oauthClientId) — booting '{name}' without joining the tailnet"
                 );
                 false
-            } else {
-                require_auth_key(env::var(&key_env).ok(), &key_env).is_ok()
             }
-        }
-        JoinMode::Skip => false,
-    };
+        };
+    }
     // Only validate the tag when it will actually be used to join: an explicitly
-    // passed --tag is still validated for fast feedback, but a malformed tag left
-    // over in config shouldn't abort `new` when there's no auth key to join with.
-    if joins_tailnet || args.tag.is_some() {
+    // passed --tailnet-tag is still validated for fast feedback, but a malformed
+    // tag left over in config shouldn't abort `new` when there's no auth key to
+    // join with.
+    if joins_tailnet || args.tailnet_tag.is_some() {
         validate_tag(&tag)?;
     }
     let template = args
@@ -85,7 +103,7 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
         .as_deref()
         .map(|n| app.template(n))
         .transpose()?;
-    let image = if let Some(image) = args.image {
+    let mut image = if let Some(image) = args.image {
         image
     } else if let Some(image) = template.as_ref().and_then(|t| t.manifest.image.clone()) {
         image
@@ -94,6 +112,17 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
     } else {
         config.image.clone().unwrap_or_else(|| DEFAULT_IMAGE.into())
     };
+    let is_tailnet_capable = image == "lilbox-box" || image.starts_with("lilbox/tailnet/");
+    if joins_tailnet && !is_tailnet_capable {
+        match overlay::ensure_tailnet_image(&image, args.rebuild).await {
+            Ok(t) => image = t,
+            Err(e) => eprintln!(
+                "warning: could not build a tailnet-capable image for '{image}': {e:#}; booting the base as-is"
+            ),
+        }
+    } else if !want_tailnet && is_tailnet_capable {
+        eprintln!("note: '{image}' is tailnet-capable; pass --tailnet to join the tailnet");
+    }
     let guest_port = args
         .port
         .or_else(|| template.as_ref().and_then(|t| t.manifest.port))

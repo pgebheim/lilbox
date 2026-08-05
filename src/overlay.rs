@@ -495,6 +495,58 @@ async fn download_tailscale(arch: &str, version: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Derive a deterministic, valid microsandbox image tag for the
+/// tailscalified variant of `base`, e.g.
+/// `docker.io/library/alpine:latest` -> `lilbox/tailnet/alpine-latest-ts1.102.2`.
+///
+/// The base reference is sanitized: any leading registry host (and, for
+/// Docker Hub, the `library/` official-image prefix) is stripped, then every
+/// remaining character outside `[a-z0-9._-]` (including `/` and `:`) is
+/// replaced with `-` and the result is lowercased.
+pub(crate) fn tailnet_image_tag(base: &str) -> String {
+    format!(
+        "lilbox/tailnet/{}-ts{TAILSCALE_VERSION}",
+        sanitize_base_ref(base)
+    )
+}
+
+/// Cache-aware wrapper around [`tailscalify_image`]: returns the cached tag
+/// instantly if a tailscalified variant of `base` was already built (unless
+/// `force`), otherwise builds it and returns the newly cached tag.
+pub(crate) async fn ensure_tailnet_image(base: &str, force: bool) -> Result<String> {
+    let tag = tailnet_image_tag(base);
+    if !force && microsandbox::Image::get(&tag).await.is_ok() {
+        return Ok(tag);
+    }
+    println!("building tailnet-capable {base} (first run; cached after)...");
+    tailscalify_image(base, &tag).await?;
+    Ok(tag)
+}
+
+fn sanitize_base_ref(base: &str) -> String {
+    let (host, rest) = match base.split_once('/') {
+        Some((host, rest)) if host.contains('.') || host.contains(':') || host == "localhost" => {
+            (Some(host), rest)
+        }
+        _ => (None, base),
+    };
+    let rest = if host == Some("docker.io") {
+        rest.strip_prefix("library/").unwrap_or(rest)
+    } else {
+        rest
+    };
+    rest.to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 /// Pull `base`, append a Tailscale layer (`tailscaled`, `tailscale`, and the
 /// `lilbox-boot` bring-up hook), write a standard OCI image-layout tar, and
 /// load it into microsandbox as `tag` -- producing a tailnet-capable image
@@ -742,6 +794,41 @@ mod tests {
 
         let err = tailscale_layer_files(&tarball_gz, version, arch).unwrap_err();
         assert!(err.to_string().contains("tailscaled"));
+    }
+
+    #[test]
+    fn tailnet_image_tag_is_deterministic() {
+        let base = "docker.io/library/alpine:latest";
+        assert_eq!(tailnet_image_tag(base), tailnet_image_tag(base));
+    }
+
+    #[test]
+    fn tailnet_image_tag_sanitizes_docker_hub_official_image() {
+        assert_eq!(
+            tailnet_image_tag("docker.io/library/alpine:latest"),
+            format!("lilbox/tailnet/alpine-latest-ts{TAILSCALE_VERSION}")
+        );
+    }
+
+    #[test]
+    fn tailnet_image_tag_sanitizes_ghcr_ref_to_valid_chars() {
+        let tag = tailnet_image_tag("ghcr.io/foo/bar:v1.0");
+        assert_eq!(
+            tag,
+            format!("lilbox/tailnet/foo-bar-v1.0-ts{TAILSCALE_VERSION}")
+        );
+        let sanitized = tag.strip_prefix("lilbox/tailnet/").unwrap();
+        assert!(
+            sanitized.chars().all(|c| c.is_ascii_lowercase()
+                || c.is_ascii_digit()
+                || matches!(c, '.' | '_' | '-')),
+            "sanitized portion '{sanitized}' contains an invalid tag character"
+        );
+    }
+
+    #[test]
+    fn tailnet_image_tag_contains_tailscale_version() {
+        assert!(tailnet_image_tag("alpine:latest").ends_with(&format!("-ts{TAILSCALE_VERSION}")));
     }
 
     #[test]
