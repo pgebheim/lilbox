@@ -1,5 +1,9 @@
 __pycache__/
 *.pyc
+# Dev worktrees live inside the repo; they are checkouts, not content.
+# rig-worktrees is the kit's old default, kept so stragglers stay ignored.
+.claude/worktrees/
+.claude/rig-worktrees/
 .lilbox/
 state.db
 .rig/epics/
