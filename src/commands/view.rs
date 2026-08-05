@@ -154,6 +154,10 @@ pub(crate) async fn image(command: ImageCommand) -> Result<()> {
             overlay::overlay_image(&base, &extra_files, &tag).await?;
             println!("overlaid {base} as {tag}");
         }
+        ImageCommand::Tailscalify { base, tag } => {
+            overlay::tailscalify_image(&base, &tag).await?;
+            println!("tailscalified {base} as {tag}");
+        }
     }
     Ok(())
 }
