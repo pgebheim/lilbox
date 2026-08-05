@@ -82,6 +82,45 @@ fn entrypoints(manifest: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// The `lilbox-herdr` subcommand an entrypoint runs, for either command form:
+/// the shim invoked directly (`["bin/lilbox-herdr", "<sub>"]`, used by actions)
+/// or through a launcher that resolves it by absolute path (`["sh", "-c", "exec
+/// \"$HERDR_PLUGIN_ROOT/bin/lilbox-herdr\" <sub>"]`, used by panes — herdr's pane
+/// spawner PATH-searches argv[0], so a relative program never resolves). Returns
+/// `None` for entrypoints that don't run the shim (e.g. the `herdr plugin pane
+/// open` actions).
+fn shim_subcommand(argv: &[String]) -> Option<String> {
+    if argv.first().is_some_and(|p| p.ends_with("lilbox-herdr")) {
+        return argv.get(1).cloned();
+    }
+    let inner = argv.iter().find(|a| a.contains("lilbox-herdr"))?;
+    inner.split_whitespace().last().map(str::to_owned)
+}
+
+/// Plugin-dir-relative paths to any bundled executable an entrypoint runs, for
+/// either command form. A direct `bin/…` token, or a `$HERDR_PLUGIN_ROOT/…`
+/// target inside a launcher string. Programs on PATH (`herdr`, `sh`) yield
+/// nothing — they aren't files we ship.
+fn plugin_relative_targets(argv: &[String]) -> Vec<String> {
+    const ROOT: &str = "$HERDR_PLUGIN_ROOT/";
+    let mut out = Vec::new();
+    for a in argv {
+        if a.starts_with("bin/") {
+            out.push(a.clone());
+        }
+        if let Some(idx) = a.find(ROOT) {
+            let rel: String = a[idx + ROOT.len()..]
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '"')
+                .collect();
+            if !rel.is_empty() {
+                out.push(rel);
+            }
+        }
+    }
+    out
+}
+
 #[test]
 fn manifest_declares_the_required_top_level_keys() {
     let manifest = manifest();
@@ -187,32 +226,51 @@ fn link_handlers_point_at_actions_this_plugin_declares() {
     }
 }
 
+/// Herdr's *pane* spawner resolves a pane command's program (argv[0]) via PATH —
+/// unlike the action runner, it does not honour the plugin dir as the program's
+/// lookup root. A relative path like `bin/lilbox-herdr` is "not found in PATH"
+/// and the pane fails to open (`plugin_pane_open_failed`), which silently breaks
+/// the plugin's headline box/agent panes. So a pane program must be a bare PATH
+/// command (e.g. `sh`) or absolute; the shim is reached by absolute path through
+/// `$HERDR_PLUGIN_ROOT` from inside that launcher.
+#[test]
+fn pane_programs_are_path_resolvable() {
+    for pane in section(&manifest(), "panes") {
+        let id = str_at(&pane, "id").unwrap();
+        let argv = argv(&pane);
+        let program = argv
+            .first()
+            .unwrap_or_else(|| panic!("pane `{id}` has no command"));
+        let relative_with_slash = program.contains('/') && !program.starts_with('/');
+        assert!(
+            !relative_with_slash,
+            "pane `{id}` runs `{program}`: herdr's pane spawner PATH-searches argv[0], \
+             so a relative path never resolves. Use a bare command or an absolute path \
+             (e.g. `sh -c 'exec \"$HERDR_PLUGIN_ROOT/bin/lilbox-herdr\" {id}'`)."
+        );
+    }
+}
+
 #[test]
 fn shim_commands_exist_and_are_executable() {
     let dir = plugin_dir();
     for entry in entrypoints(&manifest()) {
-        let argv = argv(&entry);
-        let Some(program) = argv.first() else {
-            continue;
-        };
-        // Relative programs resolve against the plugin dir, which herdr uses as
-        // the working directory for plugin commands.
-        if !program.contains('/') {
-            continue;
-        }
-        let path = dir.join(program);
-        assert!(
-            path.is_file(),
-            "manifest runs `{program}`, which is missing"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&path).unwrap().permissions().mode();
-            assert!(
-                mode & 0o111 != 0,
-                "`{program}` is not executable (mode {mode:o}); herdr execs it directly"
-            );
+        // Verify every bundled executable an entrypoint runs, whether named
+        // directly (`bin/lilbox-herdr`, actions) or by absolute path via
+        // `$HERDR_PLUGIN_ROOT` (panes). A typo in either form makes the path
+        // vanish and this fail.
+        for rel in plugin_relative_targets(&argv(&entry)) {
+            let path = dir.join(&rel);
+            assert!(path.is_file(), "manifest runs `{rel}`, which is missing");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(&path).unwrap().permissions().mode();
+                assert!(
+                    mode & 0o111 != 0,
+                    "`{rel}` is not executable (mode {mode:o}); herdr execs it directly"
+                );
+            }
         }
     }
 }
@@ -224,11 +282,9 @@ fn every_shim_subcommand_in_the_manifest_is_dispatched() {
     let shim = fs::read_to_string(plugin_dir().join("bin/lilbox-herdr")).unwrap();
     let dispatch = shim.split_once("main() {").expect("shim has a main()").1;
     for entry in entrypoints(&manifest()) {
-        let argv = argv(&entry);
-        if argv.first().is_none_or(|p| !p.ends_with("lilbox-herdr")) {
+        let Some(subcommand) = shim_subcommand(&argv(&entry)) else {
             continue;
-        }
-        let subcommand = argv.get(1).expect("shim invoked without a subcommand");
+        };
         assert!(
             dispatch.contains(&format!("{subcommand})")),
             "manifest calls `lilbox-herdr {subcommand}`, which main() does not dispatch"

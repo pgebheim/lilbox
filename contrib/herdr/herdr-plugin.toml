@@ -17,11 +17,17 @@ description = "Run agents in libkrun microVMs on your own hardware: one lilbox p
 # Boot (or reuse) this worktree's box and drop into an interactive shell at
 # /workspace. Zoomed: you're working inside the box, so there's nothing local to
 # keep beside it.
+#
+# Pane commands launch via `sh -c` and reach the shim by absolute path through
+# $HERDR_PLUGIN_ROOT: herdr's pane spawner resolves argv[0] against PATH (unlike
+# the action runner, which honours the plugin dir), so a relative `bin/...`
+# program fails with "not found in PATH". The one-shot actions below keep the
+# direct `bin/lilbox-herdr` form, which the action runner resolves fine.
 [[panes]]
 id = "box"
 title = "lilbox"
 placement = "zoomed"
-command = ["bin/lilbox-herdr", "open"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/lilbox-herdr\" open"]
 
 # Same box, but exec straight into the coding agent. This is the pane herdr's
 # agent state detection (working / blocked / done / idle) reads.
@@ -29,14 +35,14 @@ command = ["bin/lilbox-herdr", "open"]
 id = "agent"
 title = "lilbox agent"
 placement = "zoomed"
-command = ["bin/lilbox-herdr", "agent"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/lilbox-herdr\" agent"]
 
 # Live box list, refreshed in place.
 [[panes]]
 id = "boxes"
 title = "lilbox boxes"
 placement = "overlay"
-command = ["bin/lilbox-herdr", "watch"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/lilbox-herdr\" watch"]
 
 # Actions register the plugin's verbs with herdr. Invoke any of them with
 #   herdr plugin action invoke lilbox.<id>
