@@ -171,10 +171,10 @@ pub(crate) async fn cmd_agent(app: &App, args: AgentArgs) -> Result<i32> {
         let credentials_path = creds_src.as_ref().unwrap();
         let guest_claude_dir = "/root/.claude";
         let guest_credentials = "/root/.claude/.credentials.json";
-        if let Err(err) = sandbox.fs().mkdir(guest_claude_dir).await {
-            if !sandbox.fs().exists(guest_claude_dir).await.unwrap_or(false) {
-                bail!("could not create {guest_claude_dir} in agent box: {err}");
-            }
+        if let Err(err) = sandbox.fs().mkdir(guest_claude_dir).await
+            && !sandbox.fs().exists(guest_claude_dir).await.unwrap_or(false)
+        {
+            bail!("could not create {guest_claude_dir} in agent box: {err}");
         }
         sandbox
             .fs()
