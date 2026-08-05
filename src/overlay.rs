@@ -6,7 +6,7 @@
 //! is involved anywhere in this path.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{Read, Write},
     path::Path,
 };
@@ -95,15 +95,17 @@ pub(crate) async fn pull_base(reference: &str) -> Result<BaseImage> {
         ));
     }
 
-    let layer_blobs = manifest
+    let descriptors: Vec<(String, i64)> = manifest
         .layers
         .iter()
-        .zip(image_data.layers.iter())
-        .map(|(descriptor, layer)| {
-            let hex = strip_sha256(&descriptor.digest)?.to_string();
-            Ok((hex, layer.data.to_vec()))
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .map(|descriptor| (descriptor.digest.clone(), descriptor.size))
+        .collect();
+    let arrived: Vec<Vec<u8>> = image_data
+        .layers
+        .iter()
+        .map(|layer| layer.data.to_vec())
+        .collect();
+    let layer_blobs = pair_layer_blobs(reference, &descriptors, arrived)?;
 
     let manifest_bytes = serde_json::to_vec(&manifest).context("serializing pulled manifest")?;
 
@@ -112,6 +114,61 @@ pub(crate) async fn pull_base(reference: &str) -> Result<BaseImage> {
         manifest_bytes,
         layer_blobs,
     })
+}
+
+/// Pair every manifest layer descriptor with the blob that actually belongs to
+/// it, matching on the blob's own content hash rather than on arrival order.
+///
+/// `descriptors` is `(digest, declared size)` in manifest order (bottom-to-top);
+/// `arrived` is the downloaded blobs **in whatever order the registry pull
+/// produced them**. That distinction is the whole point: `oci_client`'s
+/// `Client::pull` collects layers with `buffer_unordered`, so `arrived` is in
+/// *completion* order — the smallest layer usually lands first. Zipping the two
+/// by position files each blob under a different layer's digest, which the
+/// consumer then rejects ("size mismatch: descriptor has N, archive has M").
+///
+/// Returns `(digest hex, blob bytes)` in manifest order, each digest once (an
+/// image may list the same layer twice, but its blob is pulled — and written —
+/// once). Errors if any descriptor has no matching blob or if a blob's length
+/// disagrees with its declared size, so a bad pull fails here with a clear
+/// message instead of deep inside the image loader.
+fn pair_layer_blobs(
+    reference: &str,
+    descriptors: &[(String, i64)],
+    arrived: Vec<Vec<u8>>,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut by_digest: HashMap<String, Vec<u8>> = arrived
+        .into_iter()
+        .map(|bytes| (sha256_hex(&bytes), bytes))
+        .collect();
+
+    let mut paired: Vec<(String, Vec<u8>)> = Vec::with_capacity(descriptors.len());
+    let mut emitted: HashSet<String> = HashSet::new();
+    for (digest, declared_size) in descriptors {
+        let hex = strip_sha256(digest)?;
+        let Some(bytes) = by_digest.remove(hex) else {
+            if emitted.contains(hex) {
+                // The manifest lists this layer more than once; already written.
+                continue;
+            }
+            return Err(anyhow!(
+                "no layer downloaded for '{reference}' hashes to manifest descriptor \
+                 {digest} -- the registry returned a blob set that does not match \
+                 its own manifest"
+            ));
+        };
+        if bytes.len() as i64 != *declared_size {
+            return Err(anyhow!(
+                "layer {digest} of '{reference}' is {} bytes but its manifest \
+                 descriptor declares {declared_size}",
+                bytes.len()
+            ));
+        }
+        emitted.insert(hex.to_string());
+        paired.push((hex.to_string(), bytes));
+    }
+
+    Ok(paired)
 }
 
 /// Tar `files` and gzip the result.
@@ -644,6 +701,108 @@ mod tests {
         format!("sha256:{}", byte.to_string().repeat(64))
     }
 
+    /// `(digest, declared size)` descriptors for `blobs`, in the given order.
+    fn descriptors_for(blobs: &[Vec<u8>]) -> Vec<(String, i64)> {
+        blobs
+            .iter()
+            .map(|bytes| (format!("sha256:{}", sha256_hex(bytes)), bytes.len() as i64))
+            .collect()
+    }
+
+    /// The registry pull hands back layer blobs in *completion* order --
+    /// `oci_client::Client::pull` collects them with `buffer_unordered` -- so
+    /// they must be matched to descriptors by content hash. Pairing by position
+    /// files each blob under another layer's digest, and the image loader then
+    /// rejects the archive with "size mismatch: descriptor has N, archive has M".
+    #[test]
+    fn pairs_blobs_by_digest() {
+        // Manifest order, largest first -- the shape of a real base image.
+        let blobs: Vec<Vec<u8>> = vec![vec![b'a'; 4096], vec![b'b'; 512], vec![b'c'; 24]];
+        let descriptors = descriptors_for(&blobs);
+
+        // Arrival order: the 24-byte layer is last in the manifest but finished
+        // downloading first, so it lands at index 0. This is exactly the
+        // python:latest failure -- its 249-byte final layer arrived ahead of the
+        // 49 MB first one and was written under that layer's digest.
+        let arrived = vec![blobs[2].clone(), blobs[1].clone(), blobs[0].clone()];
+
+        let paired = pair_layer_blobs("docker.io/library/python:latest", &descriptors, arrived)
+            .expect("a blob set matching the manifest should pair");
+
+        let expected: Vec<(String, Vec<u8>)> = descriptors
+            .iter()
+            .zip(blobs.iter())
+            .map(|((digest, _), bytes)| (strip_sha256(digest).unwrap().to_string(), bytes.clone()))
+            .collect();
+        assert_eq!(
+            paired, expected,
+            "each blob must be filed under the digest of its own bytes, in manifest order"
+        );
+    }
+
+    /// A descriptor with no matching blob is a bad pull, not something to pass
+    /// downstream: fail here, naming the digest that went unmatched.
+    #[test]
+    fn rejects_unmatched_descriptor() {
+        let present = vec![b'a'; 32];
+        let absent = vec![b'z'; 32];
+        let descriptors = descriptors_for(&[present.clone(), absent.clone()]);
+
+        let error = pair_layer_blobs("img", &descriptors, vec![present])
+            .expect_err("a manifest layer with no downloaded blob should fail")
+            .to_string();
+        assert!(
+            error.contains(&sha256_hex(&absent)),
+            "error should name the unmatched digest: {error}"
+        );
+    }
+
+    /// Content hash and declared size have to agree; a disagreement means the
+    /// manifest describes something other than what arrived.
+    #[test]
+    fn rejects_size_disagreement() {
+        let bytes = vec![b'a'; 64];
+        let descriptors = vec![(format!("sha256:{}", sha256_hex(&bytes)), 4096)];
+
+        let error = pair_layer_blobs("img", &descriptors, vec![bytes])
+            .expect_err("a declared size that disagrees with the blob should fail")
+            .to_string();
+        assert!(
+            error.contains("64") && error.contains("4096"),
+            "error should report both sizes: {error}"
+        );
+    }
+
+    /// An image may list the same layer twice (a repeated empty tar, say). The
+    /// blob is pulled once and lives at one path in the archive, so it must be
+    /// emitted once rather than looked up a second time and reported missing.
+    #[test]
+    fn dedupes_repeated_digest() {
+        let bytes = vec![b'a'; 16];
+        let digest = format!("sha256:{}", sha256_hex(&bytes));
+        let descriptors = vec![(digest.clone(), 16), (digest.clone(), 16)];
+
+        let paired = pair_layer_blobs("img", &descriptors, vec![bytes.clone()])
+            .expect("a layer listed twice should pair against its single blob");
+        assert_eq!(
+            paired,
+            vec![(strip_sha256(&digest).unwrap().to_string(), bytes)]
+        );
+    }
+
+    /// Digests carry their algorithm prefix; anything but sha256 is unsupported
+    /// and must not be silently filed under a truncated key.
+    #[test]
+    fn rejects_non_sha256_digest() {
+        let bytes = vec![b'a'; 8];
+        let descriptors = vec![("sha512:beef".to_string(), 8)];
+
+        let error = pair_layer_blobs("img", &descriptors, vec![bytes])
+            .expect_err("a non-sha256 digest should fail")
+            .to_string();
+        assert!(error.contains("sha512:beef"), "{error}");
+    }
+
     fn read_all_entries(path: &Path) -> HashMap<String, Vec<u8>> {
         let file = std::fs::File::open(path).unwrap();
         let mut archive = tar::Archive::new(file);
@@ -1034,6 +1193,51 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+
+    /// Pulls a real **multi-layer** base and asserts every blob landed under
+    /// the digest of its own bytes. The other live tests use single-layer
+    /// alpine, where pairing blobs to descriptors by position is trivially
+    /// correct — so they can't catch a mis-pairing. `nginx:alpine` is small but
+    /// has several layers of differing sizes, which is what makes the pull's
+    /// completion order diverge from manifest order. Ignored by default: needs
+    /// network access.
+    #[tokio::test]
+    #[ignore = "network required"]
+    async fn pulls_a_real_multi_layer_base() {
+        let reference = "docker.io/library/nginx:alpine";
+        let base_image = pull_base(reference).await.expect("pull {reference}");
+
+        let manifest: ImageManifest = serde_json::from_slice(&base_image.manifest_bytes)
+            .expect("pulled manifest should parse");
+        assert!(
+            manifest.layers().len() > 1,
+            "this test is only meaningful against a multi-layer base; \
+             {reference} reported {} layer(s)",
+            manifest.layers().len()
+        );
+
+        let blobs: HashMap<&str, &Vec<u8>> = base_image
+            .layer_blobs
+            .iter()
+            .map(|(hex, bytes)| (hex.as_str(), bytes))
+            .collect();
+        for descriptor in manifest.layers() {
+            let hex = strip_sha256(descriptor.digest().as_ref()).unwrap();
+            let bytes = blobs
+                .get(hex)
+                .unwrap_or_else(|| panic!("no blob paired with layer {hex}"));
+            assert_eq!(
+                &sha256_hex(bytes),
+                hex,
+                "blob filed under {hex} does not hash to it"
+            );
+            assert_eq!(
+                bytes.len() as u64,
+                descriptor.size(),
+                "blob filed under {hex} disagrees with its descriptor size"
+            );
+        }
+    }
 
     /// Pulls a real base image, appends the marker layer, writes the OCI
     /// archive, structurally verifies it, and (if the environment allows)
