@@ -44,113 +44,130 @@ fn assert_no_lilbox_state(home: &Path) {
     }
 }
 
-#[test]
-fn help_does_not_initialize_user_state() {
-    let home = temp_home("help");
-    let output = Command::new(env!("CARGO_BIN_EXE_lilbox"))
-        .arg("--help")
-        .env("HOME", &home)
-        .output()
-        .unwrap();
+/// `lilbox` must not create user state just because it was asked a question.
+/// `App::new()` writes the XDG dirs, so a command that only prints text has to
+/// short-circuit before app init.
+mod initializes_no_state {
+    use super::*;
 
-    assert!(output.status.success());
-    assert!(!home.join(".lilbox").exists());
-    let _ = fs::remove_dir_all(home);
-}
-
-#[test]
-fn parse_errors_do_not_initialize_user_state() {
-    let home = temp_home("parse-error");
-    let output = Command::new(env!("CARGO_BIN_EXE_lilbox"))
-        .arg("not-a-command")
-        .env("HOME", &home)
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-    assert!(!home.join(".lilbox").exists());
-    let _ = fs::remove_dir_all(home);
-}
-
-#[test]
-fn completions_prints_script_per_shell() {
-    // Markers are clap_complete v4's per-shell template idioms — if a future
-    // clap_complete bump changes its generated boilerplate, these are the
-    // strings to re-check.
-    let cases = [
-        ("bash", "complete"),
-        ("zsh", "#compdef"),
-        ("fish", "complete -c lilbox"),
-        ("elvish", "edit:completion"),
-        ("powershell", "Register-ArgumentCompleter"),
-    ];
-
-    for (shell, marker) in cases {
-        let home = temp_home(&format!("completions-{shell}"));
-        let output = lilbox_cmd(&home)
-            .args(["completions", shell])
+    #[test]
+    fn on_help() {
+        let home = temp_home("help");
+        let output = Command::new(env!("CARGO_BIN_EXE_lilbox"))
+            .arg("--help")
+            .env("HOME", &home)
             .output()
             .unwrap();
 
-        assert!(output.status.success(), "shell {shell} did not succeed");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(!stdout.is_empty(), "shell {shell} produced empty stdout");
-        assert!(
-            stdout.contains("lilbox"),
-            "shell {shell} stdout missing binary name: {stdout}"
-        );
-        assert!(
-            stdout.contains(marker),
-            "shell {shell} stdout missing marker {marker:?}: {stdout}"
-        );
+        assert!(output.status.success());
+        assert!(!home.join(".lilbox").exists());
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// An unparseable command line fails before any state is touched.
+    #[test]
+    fn on_parse_error() {
+        let home = temp_home("parse-error");
+        let output = Command::new(env!("CARGO_BIN_EXE_lilbox"))
+            .arg("not-a-command")
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        assert!(!home.join(".lilbox").exists());
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// Shell completions are generated at install time, often before the user
+    /// has any lilbox state -- generating them must not create it.
+    #[test]
+    fn on_completions() {
+        let home = temp_home("completions-state");
+        let output = lilbox_cmd(&home)
+            .args(["completions", "bash"])
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_no_lilbox_state(&home);
         let _ = fs::remove_dir_all(home);
     }
 }
 
-#[test]
-fn completions_does_not_initialize_user_state() {
-    let home = temp_home("completions-state");
-    let output = lilbox_cmd(&home)
-        .args(["completions", "bash"])
-        .output()
-        .unwrap();
+mod completions {
+    use super::*;
 
-    assert!(output.status.success());
-    assert_no_lilbox_state(&home);
-    let _ = fs::remove_dir_all(home);
-}
+    #[test]
+    fn prints_per_shell() {
+        // Markers are clap_complete v4's per-shell template idioms — if a future
+        // clap_complete bump changes its generated boilerplate, these are the
+        // strings to re-check.
+        let cases = [
+            ("bash", "complete"),
+            ("zsh", "#compdef"),
+            ("fish", "complete -c lilbox"),
+            ("elvish", "edit:completion"),
+            ("powershell", "Register-ArgumentCompleter"),
+        ];
 
-#[test]
-fn completions_rejects_invalid_shell() {
-    let home = temp_home("completions-invalid-shell");
-    let output = lilbox_cmd(&home)
-        .args(["completions", "notashell"])
-        .output()
-        .unwrap();
+        for (shell, marker) in cases {
+            let home = temp_home(&format!("completions-{shell}"));
+            let output = lilbox_cmd(&home)
+                .args(["completions", shell])
+                .output()
+                .unwrap();
 
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert_no_lilbox_state(&home);
-    let _ = fs::remove_dir_all(home);
-}
+            assert!(output.status.success(), "shell {shell} did not succeed");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(!stdout.is_empty(), "shell {shell} produced empty stdout");
+            assert!(
+                stdout.contains("lilbox"),
+                "shell {shell} stdout missing binary name: {stdout}"
+            );
+            assert!(
+                stdout.contains(marker),
+                "shell {shell} stdout missing marker {marker:?}: {stdout}"
+            );
+            let _ = fs::remove_dir_all(home);
+        }
+    }
 
-#[test]
-fn completions_requires_shell_argument() {
-    let home = temp_home("completions-missing-shell");
-    let output = lilbox_cmd(&home).arg("completions").output().unwrap();
+    /// An unknown shell fails and prints nothing -- no partial script that a
+    /// caller might source.
+    #[test]
+    fn rejects_invalid_shell() {
+        let home = temp_home("completions-invalid-shell");
+        let output = lilbox_cmd(&home)
+            .args(["completions", "notashell"])
+            .output()
+            .unwrap();
 
-    assert!(!output.status.success());
-    assert_no_lilbox_state(&home);
-    let _ = fs::remove_dir_all(home);
-}
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_no_lilbox_state(&home);
+        let _ = fs::remove_dir_all(home);
+    }
 
-#[test]
-fn completions_is_discoverable_in_help() {
-    let home = temp_home("completions-help");
-    let output = lilbox_cmd(&home).arg("--help").output().unwrap();
+    #[test]
+    fn requires_shell_arg() {
+        let home = temp_home("completions-missing-shell");
+        let output = lilbox_cmd(&home).arg("completions").output().unwrap();
 
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("completions"));
-    let _ = fs::remove_dir_all(home);
+        assert!(!output.status.success());
+        assert_no_lilbox_state(&home);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    /// Discoverable from `--help`, or nobody knows to run it.
+    #[test]
+    fn appears_in_help() {
+        let home = temp_home("completions-help");
+        let output = lilbox_cmd(&home).arg("--help").output().unwrap();
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("completions"));
+        let _ = fs::remove_dir_all(home);
+    }
 }

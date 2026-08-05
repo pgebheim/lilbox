@@ -146,8 +146,11 @@ fn effective_pane_program(argv: &[String]) -> Option<String> {
     Some(first.clone())
 }
 
+/// Herdr requires `id`, `name`, `version`, and `min_herdr_version` as
+/// top-level strings. `platforms` must list linux only -- microsandbox needs
+/// KVM, so advertising macOS or Windows would offer a plugin that can't run.
 #[test]
-fn manifest_declares_the_required_top_level_keys() {
+fn declares_top_level_keys() {
     let manifest = manifest();
     for key in ["id", "name", "version", "min_herdr_version"] {
         assert!(
@@ -168,8 +171,11 @@ fn manifest_declares_the_required_top_level_keys() {
     );
 }
 
+/// Herdr qualifies action ids as `plugin.id.action`, so a dot in a local id
+/// is ambiguous and rejected at link time. Ids must also be unique per
+/// section and use only characters herdr accepts.
 #[test]
-fn local_ids_are_unique_and_dot_free() {
+fn ids_are_unique() {
     let manifest = manifest();
     // Herdr qualifies action ids as `plugin.id.action`, so a dot in a local id
     // is ambiguous and rejected at link time.
@@ -189,8 +195,10 @@ fn local_ids_are_unique_and_dot_free() {
     }
 }
 
+/// `PLUGIN_HOOK_EVENT_KINDS` is narrower than the full event set, so a hook
+/// on a non-hookable event would never fire.
 #[test]
-fn event_hooks_reference_hookable_events() {
+fn hooks_use_hookable_events() {
     for hook in section(&manifest(), "events") {
         let on = str_at(&hook, "on").expect("event hook needs `on`");
         assert!(
@@ -200,8 +208,10 @@ fn event_hooks_reference_hookable_events() {
     }
 }
 
+/// Every action context and pane placement has to be one herdr recognizes,
+/// or the entry silently never surfaces in the UI.
 #[test]
-fn actions_and_panes_use_valid_contexts_and_placements() {
+fn uses_valid_placements() {
     let manifest = manifest();
     for action in section(&manifest, "actions") {
         let id = str_at(&action, "id").unwrap();
@@ -229,8 +239,10 @@ fn actions_and_panes_use_valid_contexts_and_placements() {
     }
 }
 
+/// A link handler naming an action this plugin does not declare is a dead
+/// link. Each also needs a non-empty pattern to match against.
 #[test]
-fn link_handlers_point_at_actions_this_plugin_declares() {
+fn links_target_own_actions() {
     let manifest = manifest();
     let actions: Vec<String> = section(&manifest, "actions")
         .iter()
@@ -259,7 +271,7 @@ fn link_handlers_point_at_actions_this_plugin_declares() {
 /// command (e.g. `sh`) or absolute; the shim is reached by absolute path through
 /// `$HERDR_PLUGIN_ROOT` from inside that launcher.
 #[test]
-fn pane_programs_are_path_resolvable() {
+fn panes_resolve_programs() {
     for pane in section(&manifest(), "panes") {
         let id = str_at(&pane, "id").unwrap();
         let program = effective_pane_program(&argv(&pane))
@@ -279,8 +291,11 @@ fn pane_programs_are_path_resolvable() {
     }
 }
 
+/// Every bundled executable the manifest runs must exist and be executable --
+/// herdr execs it directly, so a typo in either command form makes the path
+/// vanish at runtime.
 #[test]
-fn shim_commands_exist_and_are_executable() {
+fn shim_is_executable() {
     let dir = plugin_dir();
     for entry in entrypoints(&manifest()) {
         // Verify every bundled executable an entrypoint runs, whether named
@@ -305,8 +320,10 @@ fn shim_commands_exist_and_are_executable() {
 
 /// The manifest and the shim's dispatch table are two halves of one contract;
 /// a renamed subcommand on either side is a silent runtime failure otherwise.
+/// Every `lilbox-herdr` subcommand the manifest invokes must be one the shim
+/// actually dispatches, or the entrypoint fails when a user triggers it.
 #[test]
-fn every_shim_subcommand_in_the_manifest_is_dispatched() {
+fn dispatches_every_subcommand() {
     let shim = fs::read_to_string(plugin_dir().join("bin/lilbox-herdr")).unwrap();
     let dispatch = shim.split_once("main() {").expect("shim has a main()").1;
     for entry in entrypoints(&manifest()) {
