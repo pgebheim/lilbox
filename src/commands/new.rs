@@ -1,25 +1,74 @@
 use std::env;
+use std::io::IsTerminal;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
 use rusqlite::params;
 
 use crate::app::App;
 use crate::cli::NewArgs;
 use crate::overlay;
-use crate::provision::{build_template_image, provision};
-use crate::sandbox::{SandboxSettings, configure_builder};
+use crate::provision::{build_template_image, provision_sandbox};
+use crate::sandbox::{SandboxSettings, configure_builder, stop_and_remove};
 use crate::tailscale::{
-    DEFAULT_AUTH_KEY_ENV, JoinMode, is_valid_env_var_name, join_failure_detail, mint_ephemeral_key,
-    node_hostname, require_auth_key, resolve_join_mode, resolve_tag, tailscale_up_command,
-    validate_tag, wants_tailnet,
+    DEFAULT_AUTH_KEY_ENV, JoinMode, box_display_url, is_valid_env_var_name, join_failure_detail,
+    mint_ephemeral_key, node_hostname, require_auth_key, resolve_join_mode, resolve_tag,
+    tailscale_up_command, validate_tag, wants_tailnet,
 };
 use crate::util::{
-    DEFAULT_GUEST_PORT, DEFAULT_IMAGE, alloc_host_port, now, parse_duration, parse_memory,
-    random_name,
+    DEFAULT_GUEST_PORT, DEFAULT_IMAGE, alloc_host_port, now, or_cleanup, parse_duration,
+    parse_memory, random_name,
 };
 
-pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
+/// Internal knobs for `cmd_new` that aren't user-facing CLI flags. The local
+/// `lilbox new` path uses the defaults; the gateway path sets `attach` and the
+/// `[gateway] image` default (see `commands::gateway`).
+#[derive(Default)]
+pub(crate) struct NewOptions {
+    /// After the box is up, attach this process's stdio to a guest shell
+    /// (falls back to printing connection info when stdin isn't a TTY).
+    pub(crate) attach: bool,
+    /// Image to boot when neither `--image` nor a template picks one, taking
+    /// precedence over the global `[image]` config default. Gateway-only.
+    pub(crate) default_image: Option<String>,
+}
+
+/// How `cmd_new` should source the box image, in precedence order. Pure so the
+/// ordering can be unit-tested without a docker/image backend; the async
+/// dockerfile build stays in the caller.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ImageChoice {
+    /// `--image`, a template's manifest image, or a resolved default.
+    Named(String),
+    /// A template with a Dockerfile: build it (async, in the caller).
+    BuildDockerfile,
+}
+
+/// Resolve the image source: `--image` > template manifest image > template
+/// Dockerfile build > gateway default > `[image]` config > `DEFAULT_IMAGE`.
+/// `default_image` is the gateway-only tier and is `None` on the local path,
+/// so it never leaks into a plain `lilbox new`.
+pub(crate) fn resolve_image_choice(
+    arg_image: Option<String>,
+    template_image: Option<String>,
+    template_has_dockerfile: bool,
+    default_image: Option<String>,
+    config_image: Option<String>,
+) -> ImageChoice {
+    if let Some(image) = arg_image {
+        ImageChoice::Named(image)
+    } else if let Some(image) = template_image {
+        ImageChoice::Named(image)
+    } else if template_has_dockerfile {
+        ImageChoice::BuildDockerfile
+    } else if let Some(image) = default_image {
+        ImageChoice::Named(image)
+    } else {
+        ImageChoice::Named(config_image.unwrap_or_else(|| DEFAULT_IMAGE.into()))
+    }
+}
+
+pub(crate) async fn cmd_new(app: &App, args: NewArgs, opts: NewOptions) -> Result<i32> {
     let name = match args.name {
         Some(name) => name,
         None => random_name(app)?,
@@ -103,14 +152,17 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
         .as_deref()
         .map(|n| app.template(n))
         .transpose()?;
-    let mut image = if let Some(image) = args.image {
-        image
-    } else if let Some(image) = template.as_ref().and_then(|t| t.manifest.image.clone()) {
-        image
-    } else if let Some(t) = template.as_ref().filter(|t| t.dockerfile) {
-        build_template_image(t, args.rebuild).await?
-    } else {
-        config.image.clone().unwrap_or_else(|| DEFAULT_IMAGE.into())
+    let mut image = match resolve_image_choice(
+        args.image,
+        template.as_ref().and_then(|t| t.manifest.image.clone()),
+        template.as_ref().is_some_and(|t| t.dockerfile),
+        opts.default_image,
+        config.image.clone(),
+    ) {
+        ImageChoice::Named(image) => image,
+        ImageChoice::BuildDockerfile => {
+            build_template_image(template.as_ref().unwrap(), args.rebuild).await?
+        }
     };
     let is_tailnet_capable = image == "lilbox-box" || image.starts_with("lilbox/tailnet/");
     if joins_tailnet && !is_tailnet_capable {
@@ -185,6 +237,16 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
         idle_timeout: idle,
         volume: volume.as_deref(),
     });
+
+    // Register termination handlers BEFORE the VM exists, so a (rare) signal
+    // registration failure aborts here rather than orphaning a box. On the
+    // gateway path the common interruption is the SSH client disconnecting,
+    // which arrives as SIGHUP/SIGTERM (not SIGINT) — cover all three, or the
+    // atomic teardown below wouldn't fire for the case that most needs it.
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+
     let sandbox = builder.create_detached().await.with_context(|| {
         format!(
             "could not create box '{name}' from image '{image}' \
@@ -192,71 +254,181 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs) -> Result<()> {
              e.g. images/<name>/build.sh — and check `lilbox image ls`)"
         )
     })?;
-    app.db.execute(
-        "INSERT INTO boxes(name,image,guest_port,host_port,created,template,volume,expires) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![name, image, guest_port, host_port, Local::now().format("%Y-%m-%d %H:%M:%S").to_string(), template.as_ref().map(|t| &t.name), volume, expires],
-    )?;
+
+    // Provision against the handle we already hold (never `connect_box`, which
+    // needs a DB row) so the row insert below stays the atomic commit point: a
+    // box is recorded only once it's fully joined and provisioned. Any failure
+    // or termination signal in this window tears the half-built VM down.
+    // Mirrors the agent-box pattern (#106).
+    let provision = async {
+        let mut node: Option<String> = None;
+        if joins_tailnet {
+            node = join_tailnet(
+                &sandbox,
+                &tag,
+                &key_env,
+                &mut minted_key,
+                &name,
+                guest_port,
+                &image,
+            )
+            .await;
+        }
+        if let Some(template) = &template {
+            provision_sandbox(app, &sandbox, &name, template).await?;
+        }
+        Ok::<Option<String>, anyhow::Error>(node)
+    };
+    tokio::pin!(provision);
+    let outcome = tokio::select! {
+        r = &mut provision => r,
+        _ = tokio::signal::ctrl_c() => Err(anyhow!("interrupted before the box finished provisioning")),
+        _ = sigterm.recv() => Err(anyhow!("terminated before the box finished provisioning")),
+        _ = sighup.recv() => Err(anyhow!("disconnected before the box finished provisioning")),
+    };
+    let node = or_cleanup(outcome, || stop_and_remove(&name)).await?;
+
+    // Commit point. Guard the row write too: if it fails (e.g. SQLITE_BUSY, or a
+    // duplicate name that appeared in the widened window since the existence
+    // check), the VM is already built, so tear it down rather than orphan it.
+    let insert = app.db.execute(
+        "INSERT INTO boxes(name,image,guest_port,host_port,created,template,volume,expires,tailscale_node) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![name, image, guest_port, host_port, Local::now().format("%Y-%m-%d %H:%M:%S").to_string(), template.as_ref().map(|t| &t.name), volume, expires, node],
+    ).map(|_| ()).map_err(anyhow::Error::from);
+    or_cleanup(insert, || stop_and_remove(&name)).await?;
     println!("box {name} is up ({image}, guest :{guest_port})");
-    if joins_tailnet {
-        // Tailscale requires the guest to present its own auth key to
-        // `tailscale up` -- there is no host-side "join for me" call, so the
-        // box necessarily sees the real key. Unlike the agent's Anthropic key
-        // (plain HTTPS, so the builder's placeholder-secret + `allow_host` TLS
-        // substitution works), `tailscaled` talks to controlplane.tailscale.com
-        // over the encrypted noise protocol, which the substitution can't
-        // intercept -- so the real value must reach the guest directly. We
-        // deliver it as a transient env var on this one exec (never through
-        // the builder, so it's never written into the sandbox's persisted
-        // config/state). Prefer ephemeral, single-use keys (the OAuth mint
-        // path above already does this) so the guest's momentary visibility
-        // of its own key is moot.
-        let auth_key = minted_key.take().or_else(|| env::var(&key_env).ok());
-        match auth_key {
-            Some(auth_key) => {
-                let argv = tailscale_up_command(&tag, &key_env, &name, guest_port);
-                let result = sandbox
-                    .exec_with(argv[0].clone(), |e| {
-                        e.args(argv[1..].to_vec())
-                            .env(key_env.as_str(), auth_key.as_str())
-                    })
-                    .await;
-                drop(auth_key);
-                match result {
-                    Ok(output) if output.status().success => {
-                        if let Some(node) = output.stdout().ok().as_deref().and_then(node_hostname)
-                            && let Err(error) = app.db.execute(
-                                "UPDATE boxes SET tailscale_node=?1 WHERE name=?2",
-                                params![node, name],
-                            )
-                        {
-                            eprintln!(
-                                "warning: could not record tailscale node for '{name}': {error}"
-                            );
-                        }
-                    }
-                    Ok(output) => eprintln!(
-                        "warning: could not join tailnet for '{name}': {}",
-                        join_failure_detail(
-                            output.status().code,
-                            &output.stderr().unwrap_or_default(),
-                            &image,
-                        )
-                    ),
-                    Err(error) => {
-                        eprintln!("warning: could not join tailnet for '{name}': {error}")
-                    }
-                }
-            }
-            None => {
-                eprintln!(
-                    "warning: could not resolve tailnet auth key for '{name}'; skipping tailnet join"
-                );
-            }
+
+    if opts.attach {
+        // Attach AFTER the commit point and OUTSIDE the interrupt select above,
+        // so Ctrl-C in the interactive session ends the shell rather than
+        // reaping a fully-provisioned box.
+        if std::io::stdin().is_terminal() {
+            return Ok(sandbox.attach_shell().await?);
+        }
+        // No TTY (scripted `ssh host new ... < /dev/null`): can't attach, so
+        // print how to reach the box instead.
+        match box_display_url(node.as_deref(), None) {
+            Some(url) => println!("{name} ready at {url}"),
+            None => println!("{name} ready (reach it with: lilbox ssh {name})"),
+        }
+        return Ok(0);
+    }
+
+    println!("  lilbox exec {name} -- <cmd>\n  lilbox ssh {name}\n  lilbox expose {name}");
+    Ok(0)
+}
+
+/// Join a freshly-created box to the tailnet, returning its MagicDNS node name
+/// on success. Never fails the caller: every problem is warned and yields
+/// `None`, preserving `new`'s "a tailnet hiccup must not abort the box" rule.
+async fn join_tailnet(
+    sandbox: &microsandbox::Sandbox,
+    tag: &str,
+    key_env: &str,
+    minted_key: &mut Option<String>,
+    name: &str,
+    guest_port: u16,
+    image: &str,
+) -> Option<String> {
+    // Tailscale requires the guest to present its own auth key to
+    // `tailscale up` -- there is no host-side "join for me" call, so the box
+    // necessarily sees the real key. We deliver it as a transient env var on
+    // this one exec (never through the builder, so it's never written into the
+    // sandbox's persisted config/state). Prefer ephemeral, single-use keys (the
+    // OAuth mint path already does this) so the guest's momentary visibility of
+    // its own key is moot.
+    let Some(auth_key) = minted_key.take().or_else(|| env::var(key_env).ok()) else {
+        eprintln!(
+            "warning: could not resolve tailnet auth key for '{name}'; skipping tailnet join"
+        );
+        return None;
+    };
+    let argv = tailscale_up_command(tag, key_env, name, guest_port);
+    let result = sandbox
+        .exec_with(argv[0].clone(), |e| {
+            e.args(argv[1..].to_vec()).env(key_env, auth_key.as_str())
+        })
+        .await;
+    drop(auth_key);
+    match result {
+        Ok(output) if output.status().success => {
+            output.stdout().ok().as_deref().and_then(node_hostname)
+        }
+        Ok(output) => {
+            eprintln!(
+                "warning: could not join tailnet for '{name}': {}",
+                join_failure_detail(
+                    output.status().code,
+                    &output.stderr().unwrap_or_default(),
+                    image,
+                )
+            );
+            None
+        }
+        Err(error) => {
+            eprintln!("warning: could not join tailnet for '{name}': {error}");
+            None
         }
     }
-    if let Some(template) = &template {
-        provision(app, &name, template).await?;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_image_arg_flag_wins_over_everything() {
+        let choice = resolve_image_choice(
+            Some("node".into()),
+            Some("ruby".into()),
+            true,
+            Some("gw".into()),
+            Some("cfg".into()),
+        );
+        assert_eq!(choice, ImageChoice::Named("node".into()));
     }
-    println!("  lilbox exec {name} -- <cmd>\n  lilbox ssh {name}\n  lilbox expose {name}");
-    Ok(())
+
+    #[test]
+    fn resolve_image_template_wins_when_no_arg() {
+        let choice = resolve_image_choice(
+            None,
+            Some("ruby".into()),
+            true,
+            Some("gw".into()),
+            Some("cfg".into()),
+        );
+        assert_eq!(choice, ImageChoice::Named("ruby".into()));
+    }
+
+    #[test]
+    fn resolve_image_builds_dockerfile_when_no_arg_or_template_image() {
+        let choice = resolve_image_choice(None, None, true, Some("gw".into()), Some("cfg".into()));
+        assert_eq!(choice, ImageChoice::BuildDockerfile);
+    }
+
+    #[test]
+    fn resolve_image_gateway_default_wins_over_config() {
+        let choice = resolve_image_choice(None, None, false, Some("gw".into()), Some("cfg".into()));
+        assert_eq!(choice, ImageChoice::Named("gw".into()));
+    }
+
+    #[test]
+    fn resolve_image_config_used_when_no_gateway_default() {
+        let choice = resolve_image_choice(None, None, false, None, Some("cfg".into()));
+        assert_eq!(choice, ImageChoice::Named("cfg".into()));
+    }
+
+    #[test]
+    fn resolve_image_falls_back_to_default_when_nothing_set() {
+        let choice = resolve_image_choice(None, None, false, None, None);
+        assert_eq!(choice, ImageChoice::Named(DEFAULT_IMAGE.into()));
+    }
+
+    #[test]
+    fn resolve_image_gateway_tier_absent_on_local_path() {
+        // The local `lilbox new` caller passes default_image: None, so the
+        // gateway tier can never divert a plain `new` — it falls to config.
+        let choice = resolve_image_choice(None, None, false, None, Some("cfg".into()));
+        assert_eq!(choice, ImageChoice::Named("cfg".into()));
+    }
 }

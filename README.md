@@ -123,7 +123,7 @@ lilbox run -- python3 -c 'print("ran in a throwaway microVM")'
 
 | Command | Does |
 |---|---|
-| `lilbox new [NAME] [--template T] [--image I] [--port P] [--cpus N] [--memory M] [--rebuild] [--tailnet] [--tailnet-tag TAG] [--no-persist] [--volume V] [--ttl D] [--idle-timeout D]` | Boot a persistent box (default image `python`, guest port `8000`, persistent `/root` home; isolated by default — pass `--tailnet` (or `--tailnet-tag`) to join the tailnet) |
+| `lilbox new [NAME] [--template T] [--image I] [--port P] [--cpus N] [--memory M] [--rebuild] [--tailnet\|--tailscale] [--tailnet-tag TAG] [--no-persist] [--volume V] [--ttl D] [--idle-timeout D]` | Boot a persistent box (default image `python`, guest port `8000`, persistent `/root` home; isolated by default — pass `--tailnet` (or `--tailnet-tag`) to join the tailnet) |
 | `lilbox templates` | List available box templates |
 | `lilbox provision NAME` | Re-run a box's template setup script |
 | `lilbox ls [--json]` | List boxes with live status + published URLs (`--json` for scripting) |
@@ -145,6 +145,7 @@ lilbox run -- python3 -c 'print("ran in a throwaway microVM")'
 | `lilbox image ls` | List the embedded runtime's image cache |
 | `lilbox rm NAME [--keep-data]` | Remove a box + unpublish; deletes its home volume unless `--keep-data` |
 | `lilbox stat NAME` | Detailed box info |
+| `lilbox gateway` | SSH forced-command entry point: dispatch `$SSH_ORIGINAL_COMMAND` through an allowlist ([remote provisioning](#remote-provisioning-over-ssh-lilbox-gateway)) |
 | `lilbox doctor` | Check the embedded microsandbox runtime, KVM, Tailscale, and tailnet |
 
 ## Templates
@@ -324,6 +325,80 @@ missing/rejected credential, or an auto-tailscalify build failure (printed as
 a separate warning; `lilbox new` still boots the base image, just without a
 tailnet join). A plain `lilbox new` (no `--tailnet`/`--tailnet-tag`/`auto`)
 never attempts a join, even if a credential is present in the environment.
+
+## Remote provisioning over SSH (`lilbox gateway`)
+
+Run boxes on a KVM host from a laptop that has nothing but `ssh` — the exe.dev
+move:
+
+```bash
+ssh -t internal-host new --tailscale            # create a box and land in its shell
+ssh -t internal-host new --tailscale --image node my-box
+ssh internal-host ls
+ssh internal-host rm my-box
+```
+
+The mechanism is an **SSH forced command**. `sshd` puts whatever the client
+typed after the host into `$SSH_ORIGINAL_COMMAND` and runs a fixed program;
+`lilbox gateway` reads that string, parses it with the *same* CLI grammar, and
+dispatches it through a strict allowlist. No daemon, no open port, no local
+lilbox install.
+
+**Grammar is identical to the local CLI**, so the positional is the **box
+name**, not the image: `new --tailscale python` makes a box *named* `python`
+running the gateway's default image. Choose the runtime with `--image`
+(`new --tailscale --image node`), and set the default for bare `new` with a
+`[gateway]` table in the host's `~/.config/lilbox/config.toml`:
+
+```toml
+[gateway]
+image = "python"   # booted when `new` is given neither --image nor a template
+```
+
+Image precedence on the gateway path: `--image` › template image › `[gateway]
+image` › `[image]` › built-in default.
+
+**Attach UX:** with `ssh -t` (a PTY) a gateway `new` drops you straight into the
+new box's shell; exiting closes the SSH session but leaves the box running.
+Without a TTY (`ssh host new ... < /dev/null` in a script) it prints the box's
+name and MagicDNS URL instead.
+
+### Host setup
+
+Give a dedicated user on the host the KVM stack, `lilbox` on `PATH`, and an
+`authorized_keys` entry per client key that pins the forced command:
+
+```
+command="/usr/local/bin/lilbox-gateway",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty ssh-ed25519 AAAA... you@laptop
+```
+
+(Drop `no-pty` — or use `command="lilbox gateway"` directly — if you want the
+attach-into-the-box UX, which needs a PTY.)
+
+Forced commands run with a **minimal environment**, so a bare `command="lilbox
+gateway"` won't see the Tailscale OAuth secret. Point it at a thin wrapper that
+exports the credential first:
+
+```sh
+#!/bin/sh
+# /usr/local/bin/lilbox-gateway
+export TS_OAUTH_CLIENT_SECRET="tskey-client-..."   # or TS_AUTHKEY=...
+exec lilbox gateway
+```
+
+**Allowlist.** Only `new`, `ssh`, `ls`, `stat`, `url`, `logs`, `stop`, `start`,
+`restart`, `rm` are reachable; everything else (`cp`, `exec`, `run`, `agent`,
+image/template management, `gateway` itself) is rejected. Because the command is
+`shlex`-split into an argv and handed straight to the parser — never to a shell
+— `ssh host 'new; rm -rf /'` is inert: `new;` is just an unknown subcommand.
+Note that `rm` lets a key holder delete boxes and `ssh <box> -- <cmd>` runs
+commands *inside* a box, so treat each authorized key as trusted.
+
+### Tailscale-SSH variant
+
+If the host is itself a tailnet node, you don't need OpenSSH key management at
+all — reach the same forced command over Tailscale SSH (`ssh` restriction set
+in your tailnet policy), and the gateway dispatch is unchanged.
 
 ## Persistent volumes (devboxes)
 
