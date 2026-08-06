@@ -1,0 +1,333 @@
+use std::env;
+
+use anyhow::Result;
+use clap::Parser;
+
+use crate::app::App;
+use crate::cli::{Cli, Command};
+use crate::commands::{dispatch, new};
+
+/// Why a `$SSH_ORIGINAL_COMMAND` was not dispatched. Distinct variants so the
+/// caller can map each to the right message + exit code, and so tests can pin
+/// which stage rejected the input.
+#[derive(Debug)]
+pub(crate) enum GatewayReject {
+    /// No command at all — a bare `ssh host` login. Not an error; print usage.
+    Empty,
+    /// Unbalanced quotes: nothing sensible to hand the parser.
+    Unshlexable,
+    /// Split fine but isn't a valid lilbox invocation (unknown subcommand,
+    /// bad flag, `--help`, missing positional, ...).
+    Unparseable(clap::Error),
+    /// A real, valid subcommand that the gateway does not expose remotely.
+    NotAllowed(&'static str),
+}
+
+/// Subcommands reachable over the gateway. A strict allowlist by construction:
+/// anything not matched here (including any future `Command` variant, and
+/// `Gateway` itself) is rejected. Deliberately excludes host-reaching commands
+/// (`Cp`, `Exec`, `Run`), image/template management, and `Agent`.
+fn allowed(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::New(_)
+            | Command::Ssh(_)
+            | Command::Ls { .. }
+            | Command::Stat { .. }
+            | Command::Url { .. }
+            | Command::Logs(_)
+            | Command::Stop { .. }
+            | Command::Start { .. }
+            | Command::Restart { .. }
+            | Command::Rm { .. }
+    )
+}
+
+/// Human-readable name for a rejected subcommand, for the error message.
+fn command_label(command: &Command) -> &'static str {
+    match command {
+        Command::New(_) => "new",
+        Command::Ls { .. } => "ls",
+        Command::Gc => "gc",
+        Command::Templates => "templates",
+        Command::Template(_) => "template",
+        Command::Provision { .. } => "provision",
+        Command::Exec(_) => "exec",
+        Command::Ssh(_) => "ssh",
+        Command::Cp { .. } => "cp",
+        Command::Logs(_) => "logs",
+        Command::Run(_) => "run",
+        Command::Expose { .. } => "expose",
+        Command::Unexpose { .. } => "unexpose",
+        Command::Stop { .. } => "stop",
+        Command::Start { .. } => "start",
+        Command::Restart { .. } => "restart",
+        Command::Rm { .. } => "rm",
+        Command::Fork { .. } => "fork",
+        Command::Rebuild { .. } => "rebuild",
+        Command::Volumes => "volumes",
+        Command::Image(_) => "image",
+        Command::Stat { .. } => "stat",
+        Command::Url { .. } => "url",
+        Command::Agent(_) => "agent",
+        Command::Doctor => "doctor",
+        Command::Completions { .. } => "completions",
+        Command::Gateway => "gateway",
+    }
+}
+
+/// Parse a raw `$SSH_ORIGINAL_COMMAND` string and authorize it against the
+/// gateway allowlist. Pure: no shell is ever invoked (the string is
+/// `shlex`-split into an argv and handed straight to clap), so shell
+/// metacharacters like `;` or `&&` are inert literal tokens — they can only
+/// make parsing fail, never execute anything.
+pub(crate) fn authorize(original: &str) -> std::result::Result<Command, GatewayReject> {
+    if original.trim().is_empty() {
+        return Err(GatewayReject::Empty);
+    }
+    let argv = shlex::split(original).ok_or(GatewayReject::Unshlexable)?;
+    if argv.is_empty() {
+        return Err(GatewayReject::Empty);
+    }
+    let cli = Cli::try_parse_from(std::iter::once("lilbox".to_string()).chain(argv))
+        .map_err(GatewayReject::Unparseable)?;
+    if allowed(&cli.command) {
+        Ok(cli.command)
+    } else {
+        Err(GatewayReject::NotAllowed(command_label(&cli.command)))
+    }
+}
+
+/// Process exit code for a rejected command — the contract an operator scripts
+/// `ssh host ...` against. `Empty` (a bare login, or `--help`/`--version` which
+/// clap surfaces as `Unparseable` with its own 0 code) is success; everything
+/// else is a distinct non-zero.
+fn reject_exit_code(reject: &GatewayReject) -> i32 {
+    match reject {
+        GatewayReject::Empty => 0,
+        GatewayReject::Unshlexable | GatewayReject::NotAllowed(_) => 2,
+        GatewayReject::Unparseable(error) => error.exit_code(),
+    }
+}
+
+fn print_usage() {
+    eprintln!(
+        "lilbox gateway: run a lilbox command over SSH, e.g.\n  \
+         ssh -t <host> new --tailscale            # create a box and drop into it\n  \
+         ssh -t <host> new --tailscale --image node my-box\n  \
+         ssh <host> ls\n  \
+         ssh <host> rm <box>\n\
+         allowed: new, ssh, ls, stat, url, logs, stop, start, restart, rm"
+    );
+}
+
+pub(crate) async fn cmd_gateway(app: &App) -> Result<i32> {
+    let original = env::var("SSH_ORIGINAL_COMMAND").unwrap_or_default();
+    match authorize(&original) {
+        Ok(Command::New(args)) => {
+            let default_image = app.config()?.gateway.image;
+            new::cmd_new(
+                app,
+                args,
+                new::NewOptions {
+                    attach: true,
+                    default_image,
+                },
+            )
+            .await
+        }
+        // Boxed to break the dispatch → cmd_gateway → dispatch type-level async
+        // cycle; the allowlist forbids `Gateway`, so this never recurses at run
+        // time.
+        Ok(command) => Box::pin(dispatch(app, command)).await,
+        Err(reject) => {
+            match &reject {
+                GatewayReject::Empty => print_usage(),
+                GatewayReject::Unshlexable => {
+                    eprintln!("gateway: could not parse command (unbalanced quotes)")
+                }
+                // Routes usage/errors to the right stream; for `--help`/`--version`
+                // this prints them (and `reject_exit_code` yields 0).
+                GatewayReject::Unparseable(error) => {
+                    let _ = error.print();
+                }
+                GatewayReject::NotAllowed(name) => {
+                    eprintln!("gateway: '{name}' is not permitted over the gateway")
+                }
+            }
+            Ok(reject_exit_code(&reject))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_with_positional_name_and_tailscale_is_allowed() {
+        let command = authorize("new python --tailscale").unwrap();
+        match command {
+            Command::New(args) => {
+                assert_eq!(args.name.as_deref(), Some("python"));
+                assert!(args.tailnet);
+                // The positional binds to the box NAME, not the image.
+                assert!(args.image.is_none());
+            }
+            other => panic!("expected New, got {}", command_label(&other)),
+        }
+    }
+
+    #[test]
+    fn new_with_only_tailscale_flag_is_allowed() {
+        let command = authorize("new --tailscale").unwrap();
+        match command {
+            Command::New(args) => {
+                assert!(args.name.is_none());
+                assert!(args.tailnet);
+            }
+            other => panic!("expected New, got {}", command_label(&other)),
+        }
+    }
+
+    #[test]
+    fn new_with_image_flag_override_is_allowed() {
+        let command = authorize("new my-box --image node").unwrap();
+        match command {
+            Command::New(args) => {
+                assert_eq!(args.name.as_deref(), Some("my-box"));
+                assert_eq!(args.image.as_deref(), Some("node"));
+            }
+            other => panic!("expected New, got {}", command_label(&other)),
+        }
+    }
+
+    #[test]
+    fn read_only_commands_are_allowed() {
+        for input in ["ls", "stat foo", "url foo", "logs foo"] {
+            assert!(authorize(input).is_ok(), "{input} should be allowed");
+        }
+    }
+
+    #[test]
+    fn lifecycle_commands_are_allowed() {
+        for input in ["ssh foo", "stop foo", "start foo", "restart foo", "rm foo"] {
+            assert!(authorize(input).is_ok(), "{input} should be allowed");
+        }
+    }
+
+    #[test]
+    fn host_reaching_and_management_commands_are_denied() {
+        for input in [
+            "cp a b",
+            "agent",
+            "run",
+            "exec foo -- ls",
+            "image ls",
+            "template add foo",
+            "expose foo",
+            "fork foo",
+            "rebuild foo",
+            "provision foo",
+            "doctor",
+            "completions bash",
+            "gateway",
+        ] {
+            assert!(
+                matches!(authorize(input), Err(GatewayReject::NotAllowed(_))),
+                "{input} should be NotAllowed"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_metacharacters_do_not_inject() {
+        // No shell is involved: `new;` is one literal token → unknown
+        // subcommand, and the trailing `rm -rf /` are stray positionals. Either
+        // way it fails to parse and is never dispatched as a valid `new`.
+        assert!(matches!(
+            authorize("new; rm -rf /"),
+            Err(GatewayReject::Unparseable(_))
+        ));
+        assert!(matches!(
+            authorize("new ; rm -rf /"),
+            Err(GatewayReject::Unparseable(_))
+        ));
+    }
+
+    #[test]
+    fn empty_or_whitespace_command_is_empty() {
+        assert!(matches!(authorize(""), Err(GatewayReject::Empty)));
+        assert!(matches!(authorize("   "), Err(GatewayReject::Empty)));
+    }
+
+    #[test]
+    fn unbalanced_quote_is_unshlexable() {
+        assert!(matches!(
+            authorize("new \"unterminated"),
+            Err(GatewayReject::Unshlexable)
+        ));
+    }
+
+    #[test]
+    fn unknown_flag_is_unparseable() {
+        assert!(matches!(
+            authorize("ls --bogus-flag"),
+            Err(GatewayReject::Unparseable(_))
+        ));
+    }
+
+    #[test]
+    fn missing_required_positional_is_unparseable() {
+        // `rm` requires a box name.
+        assert!(matches!(
+            authorize("rm"),
+            Err(GatewayReject::Unparseable(_))
+        ));
+    }
+
+    #[test]
+    fn help_flag_is_unparseable_not_dispatched() {
+        // clap surfaces --help as an error kind; it must not fall through to a
+        // dispatchable command.
+        assert!(matches!(
+            authorize("new --help"),
+            Err(GatewayReject::Unparseable(_))
+        ));
+    }
+
+    // `Command` doesn't derive Debug, so `.unwrap_err()` won't compile; extract
+    // the rejection by hand instead.
+    fn reject(input: &str) -> GatewayReject {
+        match authorize(input) {
+            Ok(_) => panic!("expected '{input}' to be rejected"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn empty_command_exits_zero() {
+        assert_eq!(reject_exit_code(&reject("")), 0);
+    }
+
+    #[test]
+    fn help_exits_zero() {
+        // A remote `--help` should print help and succeed, not error out.
+        assert_eq!(reject_exit_code(&reject("new --help")), 0);
+    }
+
+    #[test]
+    fn not_allowed_exits_nonzero() {
+        assert_eq!(reject_exit_code(&reject("cp a b")), 2);
+    }
+
+    #[test]
+    fn unshlexable_exits_nonzero() {
+        assert_eq!(reject_exit_code(&reject("new \"x")), 2);
+    }
+
+    #[test]
+    fn unparseable_flag_exits_nonzero() {
+        assert_ne!(reject_exit_code(&reject("ls --bogus")), 0);
+    }
+}

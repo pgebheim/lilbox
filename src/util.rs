@@ -113,6 +113,25 @@ pub(crate) fn successful_output(program: &Path, args: &[&str]) -> Result<String>
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Run `result`; if it's `Err`, run `cleanup` exactly once (best-effort — a
+/// cleanup failure is swallowed, the ORIGINAL error is returned). On `Ok`,
+/// `cleanup` never runs. Returns the original result. Shared by the atomic
+/// box-provisioning paths (`commands::new`, `commands::agent`) so a failure or
+/// interrupt after the VM is built tears it down instead of orphaning it.
+pub(crate) async fn or_cleanup<T, C, Fut>(result: Result<T>, cleanup: C) -> Result<T>
+where
+    C: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    match result {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let _ = cleanup().await;
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +149,56 @@ mod tests {
         assert_eq!(parse_memory("512M").unwrap(), 512);
         assert_eq!(parse_memory("2G").unwrap(), 2048);
         assert!(parse_memory("lots").is_err());
+    }
+
+    #[tokio::test]
+    async fn or_cleanup_ok_result_does_not_run_cleanup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let result: Result<i32> = Ok(42);
+
+        let outcome = or_cleanup(result, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert_eq!(outcome.unwrap(), 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn or_cleanup_err_result_runs_cleanup_once_and_returns_original_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let result: Result<i32> = Err(anyhow::anyhow!("original failure"));
+
+        let outcome = or_cleanup(result, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert_eq!(outcome.unwrap_err().to_string(), "original failure");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn or_cleanup_err_result_swallows_cleanup_error_and_returns_original_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let result: Result<i32> = Err(anyhow::anyhow!("original failure"));
+
+        let outcome = or_cleanup(result, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("cleanup failure"))
+        })
+        .await;
+
+        assert_eq!(outcome.unwrap_err().to_string(), "original failure");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
