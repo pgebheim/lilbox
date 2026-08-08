@@ -394,11 +394,19 @@ image/template management, `gateway` itself) is rejected. Because the command is
 Note that `rm` lets a key holder delete boxes and `ssh <box> -- <cmd>` runs
 commands *inside* a box, so treat each authorized key as trusted.
 
-### Tailscale-SSH variant
+### Heads-up: Tailscale SSH bypasses this
 
-If the host is itself a tailnet node, you don't need OpenSSH key management at
-all — reach the same forced command over Tailscale SSH (`ssh` restriction set
-in your tailnet policy), and the gateway dispatch is unchanged.
+If the host runs **Tailscale SSH** (`tailscale up --ssh`), tailnet connections
+to port 22 are handled by `tailscaled`, which does **not** read OpenSSH's
+`authorized_keys` — so the forced-command entry above never fires over the
+tailnet, and every connection lands in the target user's normal login shell.
+The forced-command gateway therefore only works where **OpenSSH** actually
+handles the connection: a host without Tailscale SSH on :22, an OpenSSH instance
+on a non-22 port (Tailscale SSH only intercepts 22), or a LAN/loopback path.
+
+A Tailscale-SSH-native gateway — a dedicated login-shell user gated by a tailnet
+`ssh` policy stanza, with per-caller identity from `tailscale whois` (no keys) —
+is the intended path on such hosts and is tracked as follow-up.
 
 ## Persistent volumes (devboxes)
 
