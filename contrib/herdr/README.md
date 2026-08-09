@@ -16,7 +16,7 @@ worktree instead of shuttling snapshots, and costs nothing per hour.
 
 - Linux host with KVM — microsandbox boots libkrun microVMs (`lilbox doctor`)
 - `lilbox` on `PATH`
-- herdr **0.7.0+**
+- herdr **0.7.5+** (popup pane placement)
 - `jq` — herdr hands plugins their context as JSON
 - `fzf` — for the `lilbox.manage` box picker
 
@@ -104,7 +104,7 @@ fires regardless of how you drive herdr.
 |---|---|
 | `lilbox.open` | Boot (or reuse) this worktree's box, shell in at `/workspace` |
 | `lilbox.agent` | Same box, exec straight into the coding agent |
-| `lilbox.boxes` | Live overlay of every box (`lilbox ls`) |
+| `lilbox.boxes` | Live popup of every box (`lilbox ls`) |
 | `lilbox.manage` | fzf picker over every box: attach, stop, destroy, expose |
 | `lilbox.gc` | Destroy every box whose worktree is gone |
 | `lilbox.status` | This worktree's box name, status, and URL |

@@ -10,7 +10,7 @@
 id = "lilbox"
 name = "lilbox"
 version = "0.1.0"
-min_herdr_version = "0.7.0"
+min_herdr_version = "0.7.5"
 platforms = ["linux"]                 # microsandbox needs KVM
 description = "Run agents in libkrun microVMs on your own hardware: one lilbox per worktree, torn down with it."
 
@@ -37,19 +37,25 @@ title = "lilbox agent"
 placement = "zoomed"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/lilbox-herdr\" agent"]
 
-# Live box list, refreshed in place.
+# Live box list, refreshed in place. Popup rather than overlay: overlays are
+# normal tiled panes (the window grows, then re-tiles small around them),
+# while a popup floats modally at a fixed size and never disturbs the layout.
 [[panes]]
 id = "boxes"
 title = "lilbox boxes"
-placement = "overlay"
+placement = "popup"
+width = "80%"
+height = "60%"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/lilbox-herdr\" watch"]
 
 # fzf picker over every box — attach, stop, destroy, expose — regardless of
-# which workspace (if any) created it.
+# which workspace (if any) created it. Transient by nature, so a popup.
 [[panes]]
 id = "manage"
 title = "lilbox manage"
-placement = "overlay"
+placement = "popup"
+width = "80%"
+height = "60%"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/lilbox-herdr\" manage"]
 
 # Actions register the plugin's verbs with herdr. Invoke any of them with
@@ -77,7 +83,7 @@ command = ["herdr", "plugin", "pane", "open", "--plugin", "lilbox", "--entrypoin
 
 [[actions]]
 id = "boxes"
-title = "lilbox: boxes overlay"
+title = "lilbox: boxes popup"
 contexts = ["global"]
 command = ["herdr", "plugin", "pane", "open", "--plugin", "lilbox", "--entrypoint", "boxes"]
 

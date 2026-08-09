@@ -309,12 +309,31 @@ manage_act() {
 	esac
 }
 
+# Hold a transient popup open so a message doesn't flash by before the
+# command exits and closes it. No-op without a terminal (tests, pipes).
+wait_for_key() {
+	# Probe, don't just test -c: the node exists even with no controlling
+	# terminal (CI, pipes), and a failed </dev/tty redirect is noisy.
+	(: </dev/tty) 2>/dev/null || return 0
+	printf 'press any key to close' >&2
+	read -rsn1 </dev/tty 2>/dev/null || true
+	printf '\n' >&2
+}
+
 cmd_manage() {
-	require "$LILBOX_FZF_BIN" "install fzf, or set LILBOX_FZF_BIN in config.env"
+	if ! command -v "$LILBOX_FZF_BIN" >/dev/null 2>&1; then
+		printf 'lilbox-herdr: %s not found — the box picker needs fzf (install fzf, or set LILBOX_FZF_BIN in config.env)\n' \
+			"$LILBOX_FZF_BIN" >&2
+		wait_for_key
+		exit 1
+	fi
 	local rows name self
 	rows=$(manage_rows)
 	if [ -z "$rows" ]; then
+		# A popup closes the moment its command exits — hold it open or the
+		# message just flashes past.
 		echo "no boxes yet - open one with: lilbox.open"
+		wait_for_key
 		exit 0
 	fi
 	self=$(realpath "$0")
