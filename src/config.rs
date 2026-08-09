@@ -12,6 +12,16 @@ pub(crate) struct Config {
     pub(crate) max_memory: Option<String>,
     #[serde(default)]
     pub(crate) tailscale: TailscaleConfig,
+    #[serde(default)]
+    pub(crate) gateway: GatewayConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct GatewayConfig {
+    /// Image booted by a gateway `new` when neither `--image` nor a template
+    /// picks one. Sits between the template image and the global `image`
+    /// default, and only applies on the gateway path (see `commands::gateway`).
+    pub(crate) image: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -67,5 +77,23 @@ mod tests {
         assert!(config.tailscale.oauth_client_id.is_none());
         assert!(config.tailscale.oauth_client_secret_env.is_none());
         assert!(config.tailscale.auto.is_none());
+    }
+
+    #[test]
+    fn parses_gateway_table() {
+        let config: Config = toml::from_str("[gateway]\nimage = 'lilbox-box'\n").unwrap();
+        assert_eq!(config.gateway.image.as_deref(), Some("lilbox-box"));
+    }
+
+    #[test]
+    fn gateway_table_is_optional() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.gateway.image.is_none());
+    }
+
+    #[test]
+    fn gateway_table_present_but_image_absent() {
+        let config: Config = toml::from_str("[gateway]\n").unwrap();
+        assert!(config.gateway.image.is_none());
     }
 }

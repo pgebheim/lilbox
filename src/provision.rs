@@ -9,11 +9,29 @@ use crate::sandbox::{connect_box, stop_and_remove};
 use crate::tailscale::tailscale_logout_args;
 use crate::util::{find_program, now, run_external};
 
+/// Run a template's setup script in a box, reconnecting to it by name. Used by
+/// `lifecycle::provision_cmd` to re-run setup against an already-recorded box.
 pub(crate) async fn provision(app: &App, name: &str, template: &Template) -> Result<()> {
+    if template.setup.is_none() {
+        return Ok(());
+    }
+    let sandbox = connect_box(app, name, true).await?;
+    provision_sandbox(app, &sandbox, name, template).await
+}
+
+/// Run a template's setup script against an already-connected sandbox handle.
+/// `cmd_new` uses this so provisioning happens before the box is recorded in
+/// the DB (the row insert is the atomic commit point) — it must not call
+/// `connect_box`, which would require a row that doesn't exist yet.
+pub(crate) async fn provision_sandbox(
+    app: &App,
+    sandbox: &Sandbox,
+    name: &str,
+    template: &Template,
+) -> Result<()> {
     let Some(setup) = &template.setup else {
         return Ok(());
     };
-    let sandbox = connect_box(app, name, true).await?;
     fs::create_dir_all(app.logs_dir())?;
     sandbox.fs().write("/tmp/lilbox-setup.sh", setup).await?;
     println!("provisioning {name} (template {}) ...", template.name);

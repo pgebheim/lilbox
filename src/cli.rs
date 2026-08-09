@@ -83,6 +83,10 @@ pub(crate) enum Command {
     Url { name: String },
     /// Run Claude Code in a microVM against a mounted workspace.
     Agent(AgentArgs),
+    /// SSH forced-command entry point: dispatch $SSH_ORIGINAL_COMMAND through a
+    /// strict allowlist. Wire it as `command="lilbox gateway"` in an
+    /// authorized_keys entry so `ssh host new --tailscale ...` provisions a box.
+    Gateway,
     /// Check the local runtime and Tailscale installation.
     Doctor,
     /// Generate a shell completion script.
@@ -173,7 +177,7 @@ pub(crate) struct NewArgs {
     pub(crate) tailnet_tag: Option<String>,
     /// Join the tailnet (auto-builds a cached tailnet-capable variant of the
     /// image if needed). Implied by --tailnet-tag, or by [tailscale] auto = true.
-    #[arg(long)]
+    #[arg(long, visible_alias = "tailscale")]
     pub(crate) tailnet: bool,
 }
 

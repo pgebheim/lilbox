@@ -24,3 +24,10 @@ oauthClientId = "k123abc..."
 oauthClientSecretEnv = "TS_OAUTH_CLIENT_SECRET"
 # authKeyEnv = "TS_AUTHKEY"
 # auto = true                  # imply --tailnet on every `lilbox new`
+
+# Image booted by a `lilbox gateway` `new` when neither --image nor a template
+# picks one (remote SSH provisioning). Sits between the template image and the
+# global `image` default above, and only applies on the gateway path. See
+# README.md's "Remote provisioning over SSH" section.
+[gateway]
+image = "python"
