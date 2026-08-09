@@ -7,7 +7,7 @@ use crate::app::App;
 use crate::model::{BoxRow, Template};
 use crate::sandbox::{connect_box, stop_and_remove};
 use crate::tailscale::tailscale_logout_args;
-use crate::util::{find_program, now, run_external};
+use crate::util::{find_program, now, restrict_mode, run_external};
 
 /// Run a template's setup script in a box, reconnecting to it by name. Used by
 /// `lifecycle::provision_cmd` to re-run setup against an already-recorded box.
@@ -33,6 +33,7 @@ pub(crate) async fn provision_sandbox(
         return Ok(());
     };
     fs::create_dir_all(app.logs_dir())?;
+    restrict_mode(&app.logs_dir(), 0o700);
     sandbox.fs().write("/tmp/lilbox-setup.sh", setup).await?;
     println!("provisioning {name} (template {}) ...", template.name);
     let output = sandbox.exec("/bin/sh", ["/tmp/lilbox-setup.sh"]).await?;
@@ -40,6 +41,8 @@ pub(crate) async fn provision_sandbox(
     combined.extend_from_slice(output.stderr_bytes());
     let log = app.logs_dir().join(format!("{name}-setup.log"));
     fs::write(&log, combined)?;
+    // Setup output can echo secrets; keep the log owner-only.
+    restrict_mode(&log, 0o600);
     if !output.status().success {
         bail!("setup failed for '{name}' (full log: {})", log.display());
     }

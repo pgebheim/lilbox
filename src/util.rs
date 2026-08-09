@@ -77,6 +77,11 @@ pub(crate) fn parse_memory(value: &str) -> Result<u32> {
     if !(1.0..=u32::MAX as f64).contains(&mib) {
         bail!("invalid memory size '{value}'");
     }
+    // Reject fractions of a MiB rather than silently flooring them: `1.9M`
+    // used to become 1 MiB. `0.5G` (= 512 MiB) is whole and still allowed.
+    if mib.fract() != 0.0 {
+        bail!("invalid memory size '{value}' (not a whole number of MiB)");
+    }
     Ok(mib as u32)
 }
 
@@ -112,6 +117,25 @@ pub(crate) fn successful_output(program: &Path, args: &[&str]) -> Result<String>
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
+
+/// Best-effort restrict a path to `mode` (unix perms). Keeps the state dir,
+/// `state.db`, and captured provisioning logs owner-only — box metadata and
+/// setup output can hold sensitive material (e.g. env echoes). A failure warns
+/// rather than aborting: tightening perms is defense-in-depth, not a hard
+/// prerequisite for the tool to run.
+#[cfg(unix)]
+pub(crate) fn restrict_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+        eprintln!(
+            "warning: could not set mode {mode:o} on {}: {err}",
+            path.display()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn restrict_mode(_path: &Path, _mode: u32) {}
 
 /// Run `result`; if it's `Err`, run `cleanup` exactly once (best-effort — a
 /// cleanup failure is swallowed, the ORIGINAL error is returned). On `Ok`,
@@ -149,6 +173,34 @@ mod tests {
         assert_eq!(parse_memory("512M").unwrap(), 512);
         assert_eq!(parse_memory("2G").unwrap(), 2048);
         assert!(parse_memory("lots").is_err());
+    }
+
+    #[test]
+    fn parses_whole_mib_fractions_but_rejects_partial() {
+        // 0.5G == 512 MiB is whole → allowed; 1.9M would floor to 1 → rejected.
+        assert_eq!(parse_memory("0.5G").unwrap(), 512);
+        assert_eq!(parse_memory("1.5G").unwrap(), 1536);
+        assert!(parse_memory("1.9M").is_err());
+        assert!(parse_memory("0.1G").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_mode_sets_owner_only_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "lilbox-restrict-test-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        std::fs::write(&path, b"secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        restrict_mode(&path, 0o600);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_file(&path).ok();
+        assert_eq!(mode, 0o600);
     }
 
     #[tokio::test]
