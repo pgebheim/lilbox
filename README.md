@@ -4,11 +4,12 @@
 tailnet over HTTPS with one command.**
 
 SSH into a fresh Linux box, run untrusted or AI-generated code behind a real
-KVM boundary, and publish HTTP endpoints — all on hardware **you** control.
-`lilbox` is a single Rust CLI that glues together two self-hostable pieces:
+hardware-virtualization boundary, and publish HTTP endpoints — all on hardware
+**you** control. `lilbox` is a single Rust CLI that glues together two
+self-hostable pieces:
 
 - [**microsandbox**](https://microsandbox.dev) — libkrun microVMs (a real
-  kernel per box, KVM-isolated), driven through the embedded Rust SDK.
+  kernel per box, hypervisor-isolated), driven through the embedded Rust SDK.
 - [**Tailscale**](https://tailscale.com) — Serve (tailnet HTTPS) / Funnel
   (public) for publishing.
 
@@ -24,7 +25,7 @@ last one's ergonomics with the first two's locality:
 
 | | containers (Docker/Podman) | raw microsandbox | cloud sandboxes (E2B, Daytona, …) | **lilbox** |
 |---|---|---|---|---|
-| Isolation | shared host kernel | KVM microVM | vendor VMs | KVM microVM (libkrun) |
+| Isolation | shared host kernel | hypervisor microVM | vendor VMs | hypervisor microVM (libkrun) |
 | Runs on | your host | your host | someone else's cloud | **your host** |
 | Your code lives | local | local | round-trips as snapshots | **local — bind-mounts the live worktree** |
 | Named persistent devboxes | you script it | — | vendor-specific | built-in (`new` / `fork` / volumes) |
@@ -33,9 +34,9 @@ last one's ergonomics with the first two's locality:
 | Agent-in-a-box | DIY | DIY | vendor SDK | `lilbox agent` |
 
 - **vs. containers** — a container shares your kernel; a lilbox box boots its
-  own. That KVM boundary is the isolation you actually want when running code an
-  LLM just wrote — a container escape lands on your host, a microVM escape lands
-  in an empty guest kernel.
+  own. That hypervisor boundary is the isolation you actually want when running
+  code an LLM just wrote — a container escape lands on your host, a microVM
+  escape lands in an empty guest kernel.
 - **vs. raw microsandbox** — microsandbox is the isolation *primitive*; lilbox
   is the developer *workflow* on top of it: named boxes, templates, persistent
   home volumes, tailnet publishing, TTL/idle lifecycle, fork, and agent-in-a-box
@@ -48,10 +49,26 @@ last one's ergonomics with the first two's locality:
 
 ## Requirements
 
-- Linux host with KVM (`lilbox doctor` checks it; nested virtualization is fine)
+A host with hardware virtualization — either:
+
+- **Linux** (x86_64 or aarch64) with KVM; nested virtualization is fine, or
+- **macOS on Apple Silicon**, which uses Hypervisor.framework in place of KVM
+
+**Intel Macs are not supported.** microsandbox publishes no `darwin-x86_64`
+runtime bundle and its HVF backend is aarch64-only, so there is nothing to fall
+back to. See [#62](https://github.com/pgebheim/lilbox/issues/62).
+
+> **macOS is shipped but lightly travelled.** Every release builds an
+> `aarch64-apple-darwin` binary against the real HVF backend, but the boot path
+> has had far less mileage than the Linux one. If a box fails to come up on a
+> Mac, that's a bug worth filing rather than expected behaviour.
+
+Plus:
+
 - Rust 1.85+ and Cargo (build-time only)
 - [Tailscale](https://tailscale.com) (only needed for `lilbox expose`)
 
+`lilbox doctor` runs the runtime's host checks for whichever platform you're on.
 The Rust SDK downloads its matching runtime components on the first build/use.
 The separate `msb` executable is not required.
 
@@ -146,7 +163,7 @@ lilbox run -- python3 -c 'print("ran in a throwaway microVM")'
 | `lilbox rm NAME [--keep-data]` | Remove a box + unpublish; deletes its home volume unless `--keep-data` |
 | `lilbox stat NAME` | Detailed box info |
 | `lilbox gateway` | SSH forced-command entry point: dispatch `$SSH_ORIGINAL_COMMAND` through an allowlist ([remote provisioning](#remote-provisioning-over-ssh-lilbox-gateway)) |
-| `lilbox doctor` | Check the embedded microsandbox runtime, KVM, Tailscale, and tailnet |
+| `lilbox doctor` | Check the embedded microsandbox runtime, host virtualization, Tailscale, and tailnet |
 
 ## Templates
 
@@ -445,7 +462,7 @@ data is preserved and a bare `lilbox rebuild NAME` retries.
 
 `lilbox agent` runs a coding agent (Claude Code) **inside** a microVM against a
 mounted workspace — safe by construction, since AI-generated code runs behind
-the KVM boundary, not on your host.
+the hypervisor boundary, not on your host.
 
 ```bash
 lilbox agent -- "add a test for the parser"        # agent works in the current dir
