@@ -44,6 +44,14 @@ title = "lilbox boxes"
 placement = "overlay"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/lilbox-herdr\" watch"]
 
+# fzf picker over every box — attach, stop, destroy, expose — regardless of
+# which workspace (if any) created it.
+[[panes]]
+id = "manage"
+title = "lilbox manage"
+placement = "overlay"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/lilbox-herdr\" manage"]
+
 # Actions register the plugin's verbs with herdr. Invoke any of them with
 #   herdr plugin action invoke lilbox.<id>
 # or bind a key in your herdr config, e.g.:
@@ -96,6 +104,21 @@ id = "kill"
 title = "lilbox: destroy box"
 contexts = ["workspace"]
 command = ["bin/lilbox-herdr", "kill"]
+
+[[actions]]
+id = "manage"
+title = "lilbox: manage boxes"
+contexts = ["global"]
+command = ["herdr", "plugin", "pane", "open", "--plugin", "lilbox", "--entrypoint", "manage"]
+
+# Destroy every worktree-backed box whose worktree is gone. Catches boxes from
+# worktrees created outside herdr (e.g. by agents), whose removal never fires
+# the worktree.removed hook below.
+[[actions]]
+id = "gc"
+title = "lilbox: destroy stale boxes"
+contexts = ["global"]
+command = ["bin/lilbox-herdr", "gc"]
 
 [[actions]]
 id = "open-url"

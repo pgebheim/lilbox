@@ -18,6 +18,7 @@ worktree instead of shuttling snapshots, and costs nothing per hour.
 - `lilbox` on `PATH`
 - herdr **0.7.0+**
 - `jq` — herdr hands plugins their context as JSON
+- `fzf` — for the `lilbox.manage` box picker
 
 ## Where to install it (host, not a remote client)
 
@@ -70,6 +71,12 @@ key = "prefix+shift+a"
 type = "plugin_action"
 command = "lilbox.agent"
 description = "run agent in lilbox"
+
+[[keys.command]]
+key = "prefix+shift+m"
+type = "plugin_action"
+command = "lilbox.manage"
+description = "manage lilboxes"
 ```
 
 ### Driving it over Herdr Mirror
@@ -98,6 +105,8 @@ fires regardless of how you drive herdr.
 | `lilbox.open` | Boot (or reuse) this worktree's box, shell in at `/workspace` |
 | `lilbox.agent` | Same box, exec straight into the coding agent |
 | `lilbox.boxes` | Live overlay of every box (`lilbox ls`) |
+| `lilbox.manage` | fzf picker over every box: attach, stop, destroy, expose |
+| `lilbox.gc` | Destroy every box whose worktree is gone |
 | `lilbox.status` | This worktree's box name, status, and URL |
 | `lilbox.expose` | Publish the box over tailnet HTTPS, print the URL |
 | `lilbox.unexpose` | Stop publishing |
@@ -117,6 +126,34 @@ direction.
 
 Ctrl+click a published `*.ts.net` URL in any pane to shell into the box serving
 it.
+
+## Managing boxes: `lilbox.manage`
+
+The manage picker lists **every** box from `lilbox ls` — not just the current
+worktree's — so it's the control surface when worktrees are created outside
+herdr (driven by agents, say), where the box-per-worktree context actions
+don't reach. Keys:
+
+| Key | Does |
+|---|---|
+| `enter` | attach a shell pane to the box (starting it first if stopped) |
+| `ctrl-a` | attach an agent pane instead |
+| `ctrl-s` | stop the box — pause it, keep its state |
+| `ctrl-x` | destroy the box and its home volume (asks first) |
+| `ctrl-e` | toggle tailnet exposure |
+| `ctrl-r` | reload the list |
+
+Boxes whose `/workspace` bind-mount source no longer exists on disk are marked
+`⚠ path gone`. That's the leak case for agent-driven worktrees: herdr's
+`worktree.removed` teardown only fires for worktrees herdr itself manages, so
+an agent deleting its own worktree would otherwise orphan a microVM.
+`lilbox.gc` destroys every such box non-interactively (`lilbox-herdr gc
+--dry-run` to preview) — the path comes from each box's own config, so no
+mapping file is involved.
+
+Note the pane itself is just an attach point: closing a box pane detaches your
+shell but leaves the box running. Use `ctrl-s` here to pause it or `ctrl-x` to
+destroy it.
 
 ## One box per worktree
 
@@ -144,6 +181,7 @@ LILBOX_BIN=lilbox          # path to the lilbox binary
 LILBOX_IMAGE=python        # image for new boxes; lilbox-box adds tailnet identity
 LILBOX_AGENT_CMD=claude    # what the agent pane execs
 LILBOX_SHELL=bash          # what the shell pane execs
+LILBOX_FZF_BIN=fzf         # picker binary for lilbox.manage
 LILBOX_AGENT_ARGS=         # extra `lilbox agent` flags, e.g. --agents-file /path/AGENTS.md
 ```
 
@@ -163,7 +201,14 @@ herdr server starts.
 contrib/herdr/bin/lilbox-herdr name      # box name for $PWD
 contrib/herdr/bin/lilbox-herdr status
 contrib/herdr/bin/lilbox-herdr open
+contrib/herdr/bin/lilbox-herdr manage    # picker works too; attach is local
 ```
+
+## Tests
+
+`contrib/herdr/tests/run.sh` exercises the shim against stub `lilbox` / `herdr`
+/ `fzf` binaries — no KVM host or herdr server needed (needs `bash`, `jq`, and
+coreutils). It runs in CI.
 
 Inside herdr it deliberately refuses to fall back to `$PWD` — herdr runs plugin
 commands with the *plugin directory* as the working directory, so a fallback
