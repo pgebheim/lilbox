@@ -7,7 +7,30 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::config::Config;
 use crate::model::{BoxRow, Template};
 use crate::templates::{builtin_template, validate_template_name};
-use crate::util::find_program;
+use crate::util::{find_program, restrict_mode};
+
+/// Columns selected into a `BoxRow`, in the order `map_box_row` reads them.
+const BOX_COLUMNS: &str = "name,image,guest_port,host_port,serve_port,public,url,template,volume,expires,stopped_reason,created,tailscale_node";
+
+/// Map a `boxes` row selected as `BOX_COLUMNS` into a `BoxRow`. Single source
+/// of truth for the column↔field order, shared by `row()` and `rows()`.
+fn map_box_row(r: &rusqlite::Row) -> rusqlite::Result<BoxRow> {
+    Ok(BoxRow {
+        name: r.get(0)?,
+        image: r.get(1)?,
+        guest_port: r.get(2)?,
+        host_port: r.get(3)?,
+        serve_port: r.get(4)?,
+        public: r.get::<_, i64>(5)? != 0,
+        url: r.get(6)?,
+        template: r.get(7)?,
+        volume: r.get(8)?,
+        expires: r.get(9)?,
+        stopped_reason: r.get(10)?,
+        created: r.get(11)?,
+        tailscale_node: r.get(12)?,
+    })
+}
 
 pub(crate) struct App {
     pub(crate) config_dir: PathBuf,
@@ -116,10 +139,15 @@ impl App {
         fs::create_dir_all(&config_dir)?;
         fs::create_dir_all(&data_dir)?;
         fs::create_dir_all(&state_dir)?;
+        // Box metadata (state.db) and captured provisioning output (logs/) can be
+        // sensitive, so keep the state tree owner-only. A 0700 state dir also
+        // shields anything created under it later (e.g. logs/) via traversal.
+        restrict_mode(&state_dir, 0o700);
         if let Some(legacy) = dirs::home_dir().map(|home| home.join(".lilbox")) {
             migrate_legacy_dir(&legacy, &config_dir, &data_dir, &state_dir);
         }
         let db = Connection::open(state_dir.join("state.db"))?;
+        restrict_mode(&state_dir.join("state.db"), 0o600);
         migrate(&db)?;
         Ok(Self {
             config_dir,
@@ -151,16 +179,14 @@ impl App {
     }
 
     pub(crate) fn row(&self, name: &str) -> Result<Option<BoxRow>> {
-        self.db.query_row(
-            "SELECT name,image,guest_port,host_port,serve_port,public,url,template,volume,expires,stopped_reason,created,tailscale_node FROM boxes WHERE name=?1",
-            [name],
-            |r| Ok(BoxRow {
-                name: r.get(0)?, image: r.get(1)?, guest_port: r.get(2)?, host_port: r.get(3)?,
-                serve_port: r.get(4)?, public: r.get::<_, i64>(5)? != 0, url: r.get(6)?,
-                template: r.get(7)?, volume: r.get(8)?, expires: r.get(9)?, stopped_reason: r.get(10)?,
-                created: r.get(11)?, tailscale_node: r.get(12)?,
-            }),
-        ).optional().map_err(Into::into)
+        self.db
+            .query_row(
+                &format!("SELECT {BOX_COLUMNS} FROM boxes WHERE name=?1"),
+                [name],
+                map_box_row,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub(crate) fn require_row(&self, name: &str) -> Result<BoxRow> {
@@ -169,27 +195,11 @@ impl App {
     }
 
     pub(crate) fn rows(&self) -> Result<Vec<BoxRow>> {
-        let mut stmt = self.db.prepare(
-            "SELECT name,image,guest_port,host_port,serve_port,public,url,template,volume,expires,stopped_reason,created,tailscale_node FROM boxes ORDER BY created",
-        )?;
+        let mut stmt = self
+            .db
+            .prepare(&format!("SELECT {BOX_COLUMNS} FROM boxes ORDER BY created"))?;
         Ok(stmt
-            .query_map([], |r| {
-                Ok(BoxRow {
-                    name: r.get(0)?,
-                    image: r.get(1)?,
-                    guest_port: r.get(2)?,
-                    host_port: r.get(3)?,
-                    serve_port: r.get(4)?,
-                    public: r.get::<_, i64>(5)? != 0,
-                    url: r.get(6)?,
-                    template: r.get(7)?,
-                    volume: r.get(8)?,
-                    expires: r.get(9)?,
-                    stopped_reason: r.get(10)?,
-                    created: r.get(11)?,
-                    tailscale_node: r.get(12)?,
-                })
-            })?
+            .query_map([], map_box_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
