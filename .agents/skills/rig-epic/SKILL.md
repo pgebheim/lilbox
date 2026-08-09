@@ -27,7 +27,7 @@ Reads `.rig/config.json` (defaults in parentheses):
   transitions and each child's **Done** move go through the `rig-tracker` adapter
   (`gh issue edit` can't touch a ProjectV2 Status field). Resolver used below:
   `<TRACKER>` = `.rig/rig-tracker` if executable else `<RIG_DIR>/scripts/rig-tracker.sh`
-  (see [`docs/tracker-adapter.md`](../docs/tracker-adapter.md)). Absent → skip
+  (see [`docs/tracker-adapter.md`](../../docs/tracker-adapter.md)). Absent → skip
   the board moves; the `linear`/`none` paths are unchanged.
 - `vcs.baseRef` (`origin/main`), `vcs.defaultBranch` (`main`),
   `vcs.protectedBranchMergeQueue` (`false`).

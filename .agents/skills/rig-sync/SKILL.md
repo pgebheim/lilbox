@@ -16,7 +16,7 @@ terraform loop over them:
   a gate. The only things `apply` writes itself are spec-side artifacts.
 
 The deterministic diff lives in `scripts/rig-sync.ts`; this skill orchestrates it.
-Full reference: [`docs/rig-sync.md`](../docs/rig-sync.md).
+Full reference: [`docs/rig-sync.md`](../../docs/rig-sync.md).
 
 ## Configuration
 
@@ -42,7 +42,7 @@ prints JSON `{ surface:[{kind,id,role?,owner?,ref?,attrs?}], invariants:[{assert
 `(kind,id)` is the unique identity, `role`/`attrs` are the *directionally*
 compared fields, `owner`/`ref` are location metadata. Validate one with
 `bun scripts/rig-sync.ts validate-extractor <file>`. Contract + a reference
-extractor: [`docs/rig-sync.md`](../docs/rig-sync.md).
+extractor: [`docs/rig-sync.md`](../../docs/rig-sync.md).
 
 ## Verbs & arguments
 

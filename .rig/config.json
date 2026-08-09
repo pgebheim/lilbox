@@ -35,7 +35,7 @@
       },
       "closingKeyword": "Closes"
     },
-    "labelMapFile": ".claude/label-mapping.md",
+    "labelMapFile": ".rig/label-mapping.md",
     "githubIntegration": true,
     "shapeLabels": {
       "epic": "epic",
@@ -43,7 +43,7 @@
     }
   },
   "review": {
-    "patternsFile": ".claude/REVIEWER.md",
+    "patternsFile": ".rig/REVIEWER.md",
     "bot": "none",
     "maxRounds": 5
   },
