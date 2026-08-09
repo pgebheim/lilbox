@@ -169,6 +169,14 @@ pub(crate) async fn cmd_agent(app: &App, args: AgentArgs) -> Result<i32> {
         args.image,
         workspace.display()
     );
+    // Register termination handlers BEFORE the VM exists, so a (rare) signal
+    // registration failure aborts here rather than orphaning a box. Mirrors
+    // `commands::new`: when `lilbox agent` runs over SSH, a client disconnect
+    // arrives as SIGHUP/SIGTERM (not SIGINT) — cover all three, or the atomic
+    // teardown below wouldn't fire for the case that most needs it.
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
     let sandbox = builder.create_detached().await?;
     let provision = async {
         if let Some(source) = &args.agents_file {
@@ -253,6 +261,8 @@ pub(crate) async fn cmd_agent(app: &App, args: AgentArgs) -> Result<i32> {
     let outcome = tokio::select! {
         r = &mut provision => r,
         _ = tokio::signal::ctrl_c() => Err(anyhow!("interrupted before the box finished provisioning")),
+        _ = sigterm.recv() => Err(anyhow!("terminated before the box finished provisioning")),
+        _ = sighup.recv() => Err(anyhow!("disconnected before the box finished provisioning")),
     };
     or_cleanup(outcome, || stop_and_remove(&name)).await?;
     // Commit point. Guard the row write too: if it fails (e.g. SQLITE_BUSY, or a
