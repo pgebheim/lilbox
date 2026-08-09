@@ -246,7 +246,7 @@ don't pay a round-trip on. Delegate so the gate lives in one place:
        it, leave it — never clobber a further-along state.
    - **`tracker: github`: go through the tracker adapter** (resolver: `<TRACKER>`
      = `.rig/rig-tracker` if executable else `<RIG_DIR>/scripts/rig-tracker.sh`;
-     see [`docs/tracker-adapter.md`](../../docs/tracker-adapter.md)):
+     see [`docs/tracker-adapter.md`](../docs/tracker-adapter.md)):
      - **Link:** `<TRACKER> link-pr <issue#> <pr#>` — idempotently ensures the PR
        closes/links the issue (Step 3 may already have written the `Closes #<n>`;
        `link-pr` is a no-op then). This is what moves the board to **Done** on

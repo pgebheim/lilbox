@@ -48,7 +48,7 @@ the Linear and GitHub form — use the one matching `tracker.provider`.
     `<TRACKER> select --limit 100` (and `--status <col>` / `--dispatchable` to
     filter), where `<TRACKER>` = `.rig/rig-tracker` if executable else
     `<RIG_DIR>/scripts/rig-tracker.sh`. It returns `{number,title,url,status,labels,…}`
-    JSON. See [`docs/tracker-adapter.md`](../../docs/tracker-adapter.md).
+    JSON. See [`docs/tracker-adapter.md`](../docs/tracker-adapter.md).
 
 Display results grouped by status (Backlog, Todo, In Progress, In
 Review, Done — or GitHub's open/closed with labels). If the result is
