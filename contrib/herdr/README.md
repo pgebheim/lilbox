@@ -81,11 +81,41 @@ description = "manage lilboxes"
 
 ### Driving it over Herdr Mirror
 
-A `plugin_action` keybinding resolves on whichever herdr captures the prefix —
-under Mirror that's your **local** machine, where lilbox isn't installed, so the
-binding can't reach the box. Mirror forwards raw pane input but not prefix-mode
-commands, so binding it in the remote config doesn't fire either (setting it in
-both places can't bridge that). Two ways that work:
+Requires **herdr-mirror ≥ v0.2.0**. A `plugin_action` keybinding resolves on
+whichever herdr captures the prefix — under Mirror that's your **local**
+machine, where lilbox isn't installed — so the bindings above only fire when
+set on the host. Mirror's `remote-invoke` bridges that gap: bound locally, it
+runs the action on the mirrored host behind your focused pane, handing it that
+pane's remote workspace and cwd, and the box pane it opens mirrors back into
+your sidebar.
+
+`remote-invoke` takes the action as an argument, which `plugin_action` can't
+carry, so bind it as a `shell` command in your **local** herdr config — with
+the absolute path, since herdr runs shell bindings through a login `sh` that
+never reads your shell rc:
+
+```toml
+[[keys.command]]
+key = "prefix+alt+a"
+type = "shell"
+command = "~/.local/bin/herdr-mirror remote-invoke lilbox.agent"
+```
+
+Or let Mirror write it for you:
+
+```bash
+herdr-mirror remote-actions                    # what each host can invoke
+herdr-mirror bind lilbox.agent prefix+alt+a    # write the block + reload herdr
+herdr-mirror unbind lilbox.agent               # remove it again
+```
+
+Key-bound output is discarded, so failures come back as a toast — plugin not
+installed on that host, unreachable host, non-mirrored pane. Note that outside
+a mirror `remote-invoke` falls back to running the action on the *local* herdr,
+which for lilbox is the machine that deliberately has no plugin: expect a toast,
+not a box.
+
+Still available, and the only options on herdr-mirror < 0.2.0:
 
 - **Invoke from a mirrored remote pane.** That shell runs on the host, so
   `herdr plugin action invoke lilbox.agent` hits the remote herdr and its plugin
