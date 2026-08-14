@@ -59,6 +59,8 @@ fn command_label(command: &Command) -> &'static str {
         Command::Run(_) => "run",
         Command::Expose { .. } => "expose",
         Command::Unexpose { .. } => "unexpose",
+        Command::Join { .. } => "join",
+        Command::Leave { .. } => "leave",
         Command::Stop { .. } => "stop",
         Command::Start { .. } => "start",
         Command::Restart { .. } => "restart",

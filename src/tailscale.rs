@@ -1,6 +1,7 @@
-use std::{collections::HashSet, path::Path};
+use std::{collections::HashSet, env, path::Path};
 
 use anyhow::{Context, Result, anyhow, bail};
+use microsandbox::Sandbox;
 
 use crate::app::App;
 use crate::config::TailscaleConfig;
@@ -110,6 +111,145 @@ pub(crate) fn join_failure_detail(code: i32, stderr: &str, image: &str) -> Strin
         ),
         4 => "tailscaled failed to start in the guest".to_string(),
         _ => format!("tailscale up exited with status {code}"),
+    }
+}
+
+/// Join a box's guest to the tailnet, returning its MagicDNS node name.
+///
+/// Both `lilbox new` and `lilbox join` route through here, but they treat
+/// failure differently and deliberately so: `new` warns and keeps the box (a
+/// tailnet hiccup must never abort a boot), while `join` propagates the error,
+/// because there the join *is* the requested operation. That asymmetry lives in
+/// the callers -- this function always reports failure.
+///
+/// Tailscale requires the guest to present its own auth key to `tailscale up`;
+/// there is no host-side "join for me" call, so the box necessarily sees the
+/// real key. It is delivered as a transient env var on this one exec (never
+/// through the builder, so it is never written into the sandbox's persisted
+/// config/state). Prefer ephemeral, single-use keys -- the OAuth mint path
+/// already does -- so the guest's momentary visibility of its own key is moot.
+pub(crate) async fn join_box(
+    sandbox: &Sandbox,
+    tag: &str,
+    key_env: &str,
+    auth_key: String,
+    name: &str,
+    guest_port: u16,
+    image: &str,
+) -> Result<String> {
+    let argv = tailscale_up_command(tag, key_env, name, guest_port);
+    let result = sandbox
+        .exec_with(argv[0].clone(), |e| {
+            e.args(argv[1..].to_vec()).env(key_env, auth_key.as_str())
+        })
+        .await;
+    drop(auth_key);
+    let output = result.with_context(|| format!("could not join tailnet for '{name}'"))?;
+    if !output.status().success {
+        bail!(
+            "could not join tailnet for '{name}': {}",
+            join_failure_detail(
+                output.status().code,
+                &output.stderr().unwrap_or_default(),
+                image,
+            )
+        );
+    }
+    output
+        .stdout()
+        .ok()
+        .as_deref()
+        .and_then(node_hostname)
+        .ok_or_else(|| {
+            anyhow!("'{name}' joined the tailnet but its node name could not be read back")
+        })
+}
+
+/// A resolved credential for one tailnet join: the tag to advertise, the env
+/// var name that carries the key into the guest, and the key itself.
+pub(crate) struct JoinCredential {
+    pub(crate) tag: String,
+    pub(crate) key_env: String,
+    pub(crate) key: String,
+}
+
+/// Resolve a tag and auth key for a single join, minting an ephemeral key when
+/// an OAuth client is configured. `Ok(None)` means no credential is available
+/// at all (`JoinMode::Skip`) -- the caller decides whether that is fatal.
+///
+/// `cmd_new` deliberately does *not* use this: it walks the same
+/// [`resolve_join_mode`] decision but warns and continues at every step, where
+/// this bails. Sharing the policy while diverging on error handling is the
+/// intended seam; collapsing the two would drag `new`'s never-fail rule into
+/// `join`, where it would be wrong.
+pub(crate) async fn resolve_join_credential(
+    cfg: &TailscaleConfig,
+    flag_tag: Option<&str>,
+    box_name: &str,
+) -> Result<Option<JoinCredential>> {
+    match resolve_join_mode(cfg, flag_tag, |name| env::var(name).ok()) {
+        JoinMode::Mint {
+            tag,
+            client_id,
+            client_secret,
+        } => {
+            validate_tag(&tag)?;
+            let key = mint_ephemeral_key(&client_id, &client_secret, &tag, box_name).await?;
+            Ok(Some(JoinCredential {
+                tag,
+                key_env: DEFAULT_AUTH_KEY_ENV.to_string(),
+                key,
+            }))
+        }
+        JoinMode::StaticEnv { key_env } => {
+            if !is_valid_env_var_name(&key_env) {
+                bail!("tailscale authKeyEnv '{key_env}' is not a valid environment variable name");
+            }
+            let tag = resolve_tag(flag_tag, cfg.tag.as_deref());
+            validate_tag(&tag)?;
+            let key = require_auth_key(env::var(&key_env).ok(), &key_env)?;
+            Ok(Some(JoinCredential { tag, key_env, key }))
+        }
+        JoinMode::Skip => Ok(None),
+    }
+}
+
+/// Guest script that strips any tailnet identity a snapshot carried into a
+/// clone: stop the daemon and delete its state file.
+///
+/// Deliberately does **not** run `tailscale logout`. A clone that inherited
+/// state is presenting the *parent's* node identity, so logging out here would
+/// deregister the parent's node. Every step tolerates failure and an image with
+/// no `tailscaled` exits 0 -- this runs on clones of boxes that were never on
+/// the tailnet too.
+pub(crate) const TAILNET_SCRUB_SCRIPT: &str = "command -v tailscaled >/dev/null 2>&1 || exit 0; \
+pkill -x tailscaled >/dev/null 2>&1 || true; \
+rm -f /var/lib/tailscale/tailscaled.state; \
+exit 0";
+
+/// What `lilbox fork` should do about the parent's tailnet membership.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ForkPlan {
+    /// Parent holds no tailnet identity: snapshot straight away.
+    Snapshot,
+    /// Parent is joined and `--force` was passed: leave, then snapshot.
+    LeaveThenSnapshot,
+    /// Parent is joined and `--force` was not passed: refuse.
+    Refuse,
+}
+
+/// Decide whether a fork may snapshot, given the parent's recorded tailnet node
+/// and `--force`.
+///
+/// A snapshot captures the guest's `/var/lib/tailscale`, so forking a joined box
+/// boots a clone presenting the parent's node key -- two VMs, one identity, both
+/// reachable over Tailscale SSH. Pure so the guard is testable without a KVM
+/// host; the caller must run it before any snapshot work.
+pub(crate) fn plan_fork(tailscale_node: Option<&str>, force: bool) -> ForkPlan {
+    match (tailscale_node, force) {
+        (None, _) => ForkPlan::Snapshot,
+        (Some(_), true) => ForkPlan::LeaveThenSnapshot,
+        (Some(_), false) => ForkPlan::Refuse,
     }
 }
 
@@ -378,6 +518,47 @@ mod tests {
     #[test]
     fn validate_tag_rejects_bare_prefix() {
         assert!(validate_tag("tag:").is_err());
+    }
+
+    const A_NODE: &str = "web.tail1234.ts.net";
+
+    #[test]
+    fn plan_fork_snapshots_a_box_with_no_tailnet_identity() {
+        assert_eq!(plan_fork(None, false), ForkPlan::Snapshot);
+        assert_eq!(plan_fork(None, true), ForkPlan::Snapshot);
+    }
+
+    #[test]
+    fn plan_fork_refuses_a_joined_box() {
+        // The defect this guards: a snapshot carries /var/lib/tailscale, so the
+        // clone would boot presenting the parent's node key.
+        assert_eq!(plan_fork(Some(A_NODE), false), ForkPlan::Refuse);
+    }
+
+    #[test]
+    fn plan_fork_leaves_first_when_forced() {
+        assert_eq!(plan_fork(Some(A_NODE), true), ForkPlan::LeaveThenSnapshot);
+    }
+
+    #[test]
+    fn scrub_script_never_logs_out() {
+        // A clone that inherited state presents the *parent's* identity, so a
+        // logout here would deregister the parent's node, not the clone's.
+        assert!(
+            !TAILNET_SCRUB_SCRIPT.contains("logout"),
+            "scrub must not log out: {TAILNET_SCRUB_SCRIPT}"
+        );
+    }
+
+    #[test]
+    fn scrub_script_removes_state_and_tolerates_a_plain_image() {
+        assert!(TAILNET_SCRUB_SCRIPT.contains("rm -f /var/lib/tailscale/tailscaled.state"));
+        // Clones of never-joined boxes run this too, so an image with no
+        // tailscaled must exit 0 rather than fail the fork.
+        assert!(
+            TAILNET_SCRUB_SCRIPT.starts_with("command -v tailscaled >/dev/null 2>&1 || exit 0;"),
+            "scrub must short-circuit on images without tailscaled"
+        );
     }
 
     #[test]

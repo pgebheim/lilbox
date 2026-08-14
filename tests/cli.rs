@@ -145,6 +145,56 @@ fn completions_requires_shell_argument() {
 }
 
 #[test]
+fn join_and_leave_are_discoverable_in_help() {
+    let home = temp_home("join-leave-help");
+    let output = lilbox_cmd(&home).arg("--help").output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("join"), "help missing join: {stdout}");
+    assert!(stdout.contains("leave"), "help missing leave: {stdout}");
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn fork_help_documents_force() {
+    let home = temp_home("fork-help");
+    let output = lilbox_cmd(&home).args(["fork", "--help"]).output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--force"),
+        "fork help missing --force: {stdout}"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// `join`, `leave`, and `fork` all resolve the box row before touching a
+/// sandbox, so an unknown box is a clean error with no KVM involved. This also
+/// proves the new subcommands are wired through `dispatch`.
+#[test]
+fn join_leave_and_fork_reject_unknown_boxes() {
+    for args in [["join", "ghost"], ["leave", "ghost"], ["fork", "ghost"]] {
+        let home = temp_home(&format!("unknown-{}", args[0]));
+        let output = lilbox_cmd(&home).args(args).output().unwrap();
+
+        assert!(
+            !output.status.success(),
+            "`lilbox {} ghost` unexpectedly succeeded",
+            args[0]
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("no box named 'ghost'"),
+            "`lilbox {} ghost` stderr missing the unknown-box error: {stderr}",
+            args[0]
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+}
+
+#[test]
 fn completions_is_discoverable_in_help() {
     let home = temp_home("completions-help");
     let output = lilbox_cmd(&home).arg("--help").output().unwrap();
