@@ -50,6 +50,15 @@ pub(crate) enum Command {
     },
     /// Stop publishing a box.
     Unexpose { name: String },
+    /// Join a box to the tailnet as its own node.
+    Join {
+        name: String,
+        /// ACL tag to advertise (defaults to the [tailscale] tag).
+        #[arg(long)]
+        tailnet_tag: Option<String>,
+    },
+    /// Log a box out of the tailnet.
+    Leave { name: String },
     /// Stop a running box.
     Stop { name: String },
     /// Start a stopped box.
@@ -66,6 +75,9 @@ pub(crate) enum Command {
     Fork {
         name: String,
         newname: Option<String>,
+        /// Leave the tailnet first when the box is joined, instead of refusing.
+        #[arg(long)]
+        force: bool,
     },
     /// Recreate a box on an image while preserving its home volume.
     Rebuild {

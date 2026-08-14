@@ -11,9 +11,9 @@ use crate::overlay;
 use crate::provision::{build_template_image, provision_sandbox};
 use crate::sandbox::{SandboxSettings, configure_builder, stop_and_remove};
 use crate::tailscale::{
-    DEFAULT_AUTH_KEY_ENV, JoinMode, box_display_url, is_valid_env_var_name, join_failure_detail,
-    mint_ephemeral_key, node_hostname, require_auth_key, resolve_join_mode, resolve_tag,
-    tailscale_up_command, validate_tag, wants_tailnet,
+    DEFAULT_AUTH_KEY_ENV, JoinMode, box_display_url, is_valid_env_var_name, join_box,
+    mint_ephemeral_key, require_auth_key, resolve_join_mode, resolve_tag, validate_tag,
+    wants_tailnet,
 };
 use crate::util::{
     DEFAULT_GUEST_PORT, DEFAULT_IMAGE, alloc_host_port, now, or_cleanup, parse_duration,
@@ -321,6 +321,10 @@ pub(crate) async fn cmd_new(app: &App, args: NewArgs, opts: NewOptions) -> Resul
 /// Join a freshly-created box to the tailnet, returning its MagicDNS node name
 /// on success. Never fails the caller: every problem is warned and yields
 /// `None`, preserving `new`'s "a tailnet hiccup must not abort the box" rule.
+///
+/// The join itself lives in [`join_box`], shared with `lilbox join`; this
+/// wrapper exists only to convert its errors into warnings. `lilbox join` keeps
+/// them fatal.
 async fn join_tailnet(
     sandbox: &microsandbox::Sandbox,
     tag: &str,
@@ -330,43 +334,16 @@ async fn join_tailnet(
     guest_port: u16,
     image: &str,
 ) -> Option<String> {
-    // Tailscale requires the guest to present its own auth key to
-    // `tailscale up` -- there is no host-side "join for me" call, so the box
-    // necessarily sees the real key. We deliver it as a transient env var on
-    // this one exec (never through the builder, so it's never written into the
-    // sandbox's persisted config/state). Prefer ephemeral, single-use keys (the
-    // OAuth mint path already does this) so the guest's momentary visibility of
-    // its own key is moot.
     let Some(auth_key) = minted_key.take().or_else(|| env::var(key_env).ok()) else {
         eprintln!(
             "warning: could not resolve tailnet auth key for '{name}'; skipping tailnet join"
         );
         return None;
     };
-    let argv = tailscale_up_command(tag, key_env, name, guest_port);
-    let result = sandbox
-        .exec_with(argv[0].clone(), |e| {
-            e.args(argv[1..].to_vec()).env(key_env, auth_key.as_str())
-        })
-        .await;
-    drop(auth_key);
-    match result {
-        Ok(output) if output.status().success => {
-            output.stdout().ok().as_deref().and_then(node_hostname)
-        }
-        Ok(output) => {
-            eprintln!(
-                "warning: could not join tailnet for '{name}': {}",
-                join_failure_detail(
-                    output.status().code,
-                    &output.stderr().unwrap_or_default(),
-                    image,
-                )
-            );
-            None
-        }
+    match join_box(sandbox, tag, key_env, auth_key, name, guest_port, image).await {
+        Ok(node) => Some(node),
         Err(error) => {
-            eprintln!("warning: could not join tailnet for '{name}': {error}");
+            eprintln!("warning: {error:#}");
             None
         }
     }

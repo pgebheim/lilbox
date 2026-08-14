@@ -3,9 +3,11 @@ use chrono::Local;
 use microsandbox::{MicrosandboxError, Sandbox, Volume, sandbox::SandboxStatus};
 use rusqlite::params;
 
+use super::net;
 use crate::app::App;
 use crate::provision::{provision, teardown};
 use crate::sandbox::{SandboxSettings, configure_builder, stop_and_remove};
+use crate::tailscale::{ForkPlan, TAILNET_SCRUB_SCRIPT, plan_fork};
 use crate::util::{DEFAULT_GUEST_PORT, alloc_host_port, now};
 
 pub(crate) async fn gc(app: &App) -> Result<()> {
@@ -101,11 +103,31 @@ pub(crate) async fn rm(app: &App, name: String, keep_data: bool) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn fork(app: &App, name: String, newname: Option<String>) -> Result<()> {
+pub(crate) async fn fork(
+    app: &App,
+    name: String,
+    newname: Option<String>,
+    force: bool,
+) -> Result<()> {
     let row = app.require_row(&name)?;
     let new = newname.unwrap_or_else(|| format!("{name}-fork"));
     if app.row(&new)?.is_some() {
         bail!("box '{new}' already exists");
+    }
+    // After the free checks (both pure DB reads) but before any snapshot work:
+    // --force mutates the parent by taking it off the tailnet, so everything
+    // that can cheaply fail must fail first. Running here also keeps the guard
+    // testable without KVM.
+    match plan_fork(row.tailscale_node.as_deref(), force) {
+        ForkPlan::Snapshot => {}
+        ForkPlan::LeaveThenSnapshot => {
+            println!("leaving the tailnet before snapshotting {name} ...");
+            net::leave(app, name.clone()).await?;
+        }
+        ForkPlan::Refuse => bail!(
+            "box '{name}' is on the tailnet — a snapshot would clone its node identity.\n\
+             Run 'lilbox leave {name}' first, or pass --force to leave and fork in one step."
+        ),
     }
     let handle = Sandbox::get(&name).await?;
     let was_running = matches!(
@@ -141,10 +163,40 @@ pub(crate) async fn fork(app: &App, name: String, newname: Option<String>) -> Re
         .detached(true)
         .create_detached()
         .await?;
+    // A NULL tailscale_node doesn't prove the guest is clean: a box joined by
+    // hand (`lilbox exec … tailscale up`) leaves state lilbox never recorded, so
+    // the guard above can't see it. Scrub unconditionally -- the guard covers
+    // what lilbox knows about, this covers the rest.
+    scrub_tailnet_state(&new).await;
     app.db.execute("INSERT INTO boxes(name,image,guest_port,host_port,created,comment) VALUES(?1,?2,?3,?4,?5,?6)",
         params![new, row.image, row.guest_port, host_port, Local::now().format("%Y-%m-%d %H:%M:%S").to_string(), format!("forked from {name}")])?;
     println!("forked {name} -> {new}");
     Ok(())
+}
+
+/// Best-effort: strip any tailnet identity the snapshot carried into a clone.
+/// Failures only warn — an un-scrubbed clone is still a usable box, and this
+/// must never fail a fork that has already booted the VM.
+async fn scrub_tailnet_state(name: &str) {
+    let result: Result<()> = async {
+        let handle = Sandbox::get(name).await?;
+        match handle.status_snapshot() {
+            SandboxStatus::Running | SandboxStatus::Draining => {}
+            _ => return Ok(()),
+        }
+        let sandbox = handle.connect().await?;
+        let output = sandbox
+            .exec("/bin/sh", ["-c", TAILNET_SCRUB_SCRIPT])
+            .await?;
+        if !output.status().success {
+            bail!("scrub script exited non-zero");
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(err) = result {
+        eprintln!("warning: could not clear inherited tailnet state in '{name}': {err:#}");
+    }
 }
 
 pub(crate) async fn rebuild(app: &App, name: String, image: Option<String>) -> Result<()> {

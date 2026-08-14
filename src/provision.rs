@@ -102,8 +102,9 @@ pub(crate) async fn teardown(app: &App, row: &BoxRow) -> Result<()> {
 /// an ephemeral node deregisters immediately instead of waiting to go
 /// offline. Never resumes a stopped box just to log it out, and any failure
 /// here (box not gettable, not running, exec error, non-zero exit) is only
-/// warned to stderr -- it must never block `stop_and_remove`/the DB delete.
-async fn best_effort_tailnet_logout(name: &str) {
+/// warned to stderr -- it must never block `stop_and_remove`/the DB delete, nor
+/// `net::leave`'s clearing of the recorded node.
+pub(crate) async fn best_effort_tailnet_logout(name: &str) {
     let result: Result<()> = async {
         let handle = Sandbox::get(name).await?;
         match handle.status_snapshot() {

@@ -154,9 +154,11 @@ lilbox run -- python3 -c 'print("ran in a throwaway microVM")'
 | `lilbox agent [NAME] [--workspace D\|--clone URL] [--agents-file F] -- task` | Run a coding agent (Claude Code) in a box against a mounted workspace |
 | `lilbox expose NAME [--public]` | Publish the box over HTTPS (tailnet, or Funnel with `--public`) |
 | `lilbox unexpose NAME` | Stop publishing |
+| `lilbox join NAME [--tailnet-tag TAG]` | Join a box to the tailnet as its own node (for boxes booted without `--tailnet`, or whose join failed) |
+| `lilbox leave NAME` | Log a box out of the tailnet and forget its node |
 | `lilbox url NAME` | Print the published URL |
 | `lilbox stop/start/restart NAME` | Lifecycle |
-| `lilbox fork NAME [NEWNAME]` | Snapshot a box and boot a clone from it |
+| `lilbox fork NAME [NEWNAME] [--force]` | Snapshot a box and boot a clone from it (refuses if the box is on the tailnet — see [forking and tailnet identity](#forking-and-tailnet-identity)) |
 | `lilbox volumes` | List persistent home volumes (and orphans) |
 | `lilbox image load ARCHIVE --tag TAG` | Import an OCI/Docker archive through the Rust SDK |
 | `lilbox image ls` | List the embedded runtime's image cache |
@@ -270,6 +272,41 @@ reached over Tailscale SSH, add the following to your tailnet's ACL policy:
 Boxes join as **ephemeral** nodes, so a node auto-deregisters once it goes
 offline; `lilbox rm` also logs the node out directly (best-effort) so it's
 removed from the tailnet immediately rather than waiting for it to age out.
+
+### Joining after the fact: `lilbox join` / `lilbox leave`
+
+The join folded into `lilbox new` is best-effort by design — a tailnet problem
+warns and still leaves you a working box. `lilbox join NAME` is the retry, and
+the way to put a box on the tailnet that was never meant to be there at boot:
+
+```bash
+lilbox new scratch                 # no tailnet identity
+lilbox join scratch                # now its own node, with a MagicDNS name
+lilbox leave scratch               # log out, forget the node
+```
+
+Both are idempotent. Unlike the join inside `new`, `lilbox join` **fails loudly**
+when it can't join — you asked for the tailnet specifically, so quietly carrying
+on without it would be a lie.
+
+Boxes that only need to be *reached* (not to have their own identity) don't need
+this at all: `lilbox expose` publishes them through the host's tailnet node.
+
+### Forking and tailnet identity
+
+A snapshot captures the guest's `/var/lib/tailscale`, so forking a box that is on
+the tailnet would boot a clone presenting the **parent's node key** — two VMs,
+one identity, both reachable over Tailscale SSH. `lilbox fork` therefore refuses
+to snapshot a joined box:
+
+```bash
+lilbox leave web && lilbox fork web    # explicit
+lilbox fork web --force                # or leave + fork in one step
+```
+
+Clones are scrubbed of inherited tailnet state on boot regardless, which also
+covers boxes joined by hand (`lilbox exec … tailscale up`) that lilbox never
+recorded. Give a clone its own identity with `lilbox join`.
 
 ### Joining the tailnet: OAuth-minted keys vs. a static auth key
 
