@@ -293,6 +293,9 @@ pub(crate) fn herdr_vsock_route(
 /// Wire the route into a builder when herdr is driving this invocation.
 /// Best-effort by construction: with no route decision the builder passes
 /// through untouched, so provisioning can never fail because of this.
+/// Scope: `new`, `rebuild` (both via `configure_builder`) and `agent` get the
+/// route; `fork` and ad-hoc `run` deliberately do not — a fork inherits
+/// whatever its snapshot carried, and `run` boxes are ephemeral.
 pub(crate) fn with_herdr_vsock(
     builder: SandboxBuilder,
     socket_path: Option<std::path::PathBuf>,
@@ -355,14 +358,42 @@ mod herdr_vsock_tests {
     fn live_socket_gets_route_on_fixed_port() {
         let (path, _listener) = bound_socket();
         let route = herdr_vsock_route(Some(path.clone())).unwrap();
-        assert_eq!(route, (path.clone(), HERDR_VSOCK_PORT));
+        // Pin the literal: the guest-side shim (#130) hardcodes this port, so a
+        // constant change without a guest change is a silent break.
+        assert_eq!(route, (path.clone(), 47100));
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn builder_passthrough_when_no_route() {
-        let builder = Sandbox::builder("vsock-passthrough-test").image("python");
-        // With no socket, with_herdr_vsock must not add a route or error.
-        let _ = with_herdr_vsock(builder, None);
+    #[tokio::test]
+    async fn route_is_serialized_into_builder_config() {
+        let (path, _listener) = bound_socket();
+        let config = with_herdr_vsock(
+            Sandbox::builder("vsock-route-test").image("python"),
+            Some(path.clone()),
+        )
+        .build()
+        .await
+        .unwrap();
+        let serialized = serde_json::to_string(&config).unwrap();
+
+        assert!(serialized.contains(path.to_str().unwrap()));
+        assert!(serialized.contains("\"port\":47100"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn builder_passthrough_when_no_route() {
+        // With no socket, with_herdr_vsock must add no route (and not error).
+        let config = with_herdr_vsock(
+            Sandbox::builder("vsock-passthrough-test").image("python"),
+            None,
+        )
+        .build()
+        .await
+        .unwrap();
+        let serialized = serde_json::to_string(&config).unwrap();
+        // vsock serializes with skip_serializing_if = is_empty, so no route
+        // means the key is absent entirely.
+        assert!(!serialized.contains("\"vsock\""));
     }
 }
