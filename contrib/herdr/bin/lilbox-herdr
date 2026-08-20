@@ -63,6 +63,43 @@ lilbox() { command "$LILBOX_BIN" "$@"; }
 
 herdr_bin() { printf '%s' "${HERDR_BIN_PATH:-herdr}"; }
 
+# --- herdr pane identity ------------------------------------------------------
+# The pane's herdr identity as KEY=VAL lines, forwarded into the guest so the
+# in-box agent's herdr hook attributes agent state to this pane (#131).
+# HERDR_BIN_PATH is deliberately excluded: it's a host path, meaningless inside
+# the box — the guest hook talks to HERDR_SOCKET_PATH over the vsock relay.
+herdr_identity_kv() {
+	[ -n "${HERDR_ENV:-}" ] || return 0
+	printf 'HERDR_ENV=%s\n' "$HERDR_ENV"
+	local k v
+	for k in HERDR_SOCKET_PATH HERDR_PANE_ID HERDR_WORKSPACE_ID HERDR_TAB_ID; do
+		eval "v=\${$k:-}"
+		[ -n "$v" ] && printf '%s=%s\n' "$k" "$v"
+	done
+}
+
+# The agent pane's in-guest command: export the identity (attach path — the
+# provision-time `lilbox agent --env` forwarding in ensure_box never runs when
+# the box boots without a task), then make sure the unix→vsock relay listener
+# is up. #130 wires the listener into the task launch only; a box provisioned
+# for a pane never starts one, so start it here, idempotently, keyed off the
+# socket's existence. Port 47100 must match HERDR_VSOCK_PORT in src/sandbox.rs.
+agent_inner() {
+	local kv exports=() prefix=
+	while IFS= read -r kv; do
+		printf -v kv '%s=%q' "${kv%%=*}" "${kv#*=}"
+		exports+=("$kv")
+	done < <(herdr_identity_kv)
+	# export over a bare assignment prefix: the latter's persistence across
+	# `exec` isn't portable to busybox ash, which is what boxes ship.
+	[ ${#exports[@]} -gt 0 ] && prefix="export ${exports[*]}; "
+	local inner="${prefix}exec $LILBOX_AGENT_CMD"
+	if [ -n "${HERDR_SOCKET_PATH:-}" ]; then
+		inner='[ -S "$HERDR_SOCKET_PATH" ] || { mkdir -p "${HERDR_SOCKET_PATH%/*}" && socat "UNIX-LISTEN:$HERDR_SOCKET_PATH,fork,reuseaddr" "VSOCK-CONNECT:2:47100" >/dev/null & }; '"$inner"
+	fi
+	printf '%s' "$inner"
+}
+
 notify() {
 	[ -n "${HERDR_ENV:-}" ] || return 0
 	"$(herdr_bin)" notification show lilbox --body "$1" >/dev/null 2>&1 || true
@@ -144,9 +181,13 @@ ensure_box() {
 	"" | gone)
 		[ -d "$path" ] || die "worktree is gone: $path"
 		printf 'booting %s for %s ...\n' "$name" "$path"
+		# Forward the pane's herdr identity as transient --env pairs (#131),
+		# never persisted sandbox config.
+		local env_args=() kv
+		while IFS= read -r kv; do env_args+=(--env "$kv"); done < <(herdr_identity_kv)
 		# Unquoted on purpose: LILBOX_AGENT_ARGS is a flag string.
 		# shellcheck disable=SC2086
-		lilbox agent "$name" --workspace "$path" --image "$LILBOX_IMAGE" $LILBOX_AGENT_ARGS
+		lilbox agent "$name" --workspace "$path" --image "$LILBOX_IMAGE" "${env_args[@]}" $LILBOX_AGENT_ARGS
 		;;
 	*)
 		printf 'starting %s (was %s) ...\n' "$name" "$status"
@@ -526,7 +567,7 @@ main() {
 	esac
 	case $cmd in
 	open) cmd_open "exec $LILBOX_SHELL -l" ;;
-	agent) cmd_open "exec $LILBOX_AGENT_CMD" ;;
+	agent) cmd_open "$(agent_inner)" ;;
 	watch) cmd_watch ;;
 	status) cmd_status ;;
 	expose) cmd_expose ;;

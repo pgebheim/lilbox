@@ -242,6 +242,11 @@ pub(crate) struct AgentArgs {
     /// Don't inherit the host's Claude login into the box; fall back to ANTHROPIC_API_KEY injection.
     #[arg(long)]
     pub(crate) no_claude_config: bool,
+    /// Extra KEY=VAL environment for the guest agent exec. Transient: passed to
+    /// the exec call only, never persisted in the sandbox config (the herdr
+    /// plugin uses this to forward pane identity, #131).
+    #[arg(long = "env", value_name = "KEY=VAL")]
+    pub(crate) env: Vec<String>,
     #[arg(last = true)]
     pub(crate) task: Vec<String>,
 }
