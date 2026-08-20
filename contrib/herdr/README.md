@@ -16,7 +16,7 @@ worktree instead of shuttling snapshots, and costs nothing per hour.
 
 - Linux host with KVM — microsandbox boots libkrun microVMs (`lilbox doctor`)
 - `lilbox` on `PATH`
-- herdr **0.7.5+** (popup pane placement)
+- herdr **0.8.0+** (`pane report-metadata`; popup pane placement)
 - `jq` — herdr hands plugins their context as JSON
 - `fzf` — for the `lilbox.manage` box picker
 
