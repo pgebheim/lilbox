@@ -223,6 +223,17 @@ The agent needs credentials: `lilbox agent` injects `ANTHROPIC_API_KEY` from
 your environment as a scoped secret when it's set, so export it wherever the
 herdr server starts.
 
+## Sidebar badge
+
+The plugin reports each pane's box state as a `$lilbox` metadata token
+(`running` / `stopped` / `none`) on `pane.created` and `pane.focused`. Surface
+it in a sidebar row:
+
+```toml
+# ~/.config/herdr/config.toml
+ui.sidebar.agents.rows = [["state_icon", "workspace", "tab"], ["agent", "$lilbox"]]
+```
+
 ## Running the shim directly
 
 `bin/lilbox-herdr` works outside herdr, operating on the current directory:

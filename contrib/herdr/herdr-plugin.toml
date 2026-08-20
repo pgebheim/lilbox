@@ -141,6 +141,16 @@ title = "lilbox: open the box behind this URL"
 pattern = "^https://[a-zA-Z0-9._-]+\\.ts\\.net(:[0-9]+)?(/|$)"
 action = "open-url"
 
+# Keep the sidebar's $lilbox token fresh: report each pane's box state
+# (running/stopped/none) as pane metadata. Best-effort; hook never fails.
+[[events]]
+on = "pane.created"
+command = ["bin/lilbox-herdr", "hook"]
+
+[[events]]
+on = "pane.focused"
+command = ["bin/lilbox-herdr", "hook"]
+
 # Worktree removed -> destroy its box. Without this, every discarded worktree
 # leaves a microVM and its home volume behind.
 [[events]]
