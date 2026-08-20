@@ -79,9 +79,14 @@ ssh) echo "ssh $*" >>"$s/calls.log" ;;
 esac
 EOF
 
-	# `herdr` stub: records plugin pane opens.
+	# `herdr` stub: records plugin pane opens + metadata reports; serves a
+	# canned pane list for `hook --all`.
 	cat >"$STUB/herdr" <<'EOF'
 #!/usr/bin/env bash
+if [ "${1:-} ${2:-}" = "pane list" ]; then
+	cat "$LILBOX_STUB_STATE/panes.json"
+	exit 0
+fi
 echo "$*" >>"$LILBOX_STUB_STATE/herdr-calls.log"
 EOF
 
@@ -245,6 +250,106 @@ setup
 echo '[]' >"$LILBOX_STUB_STATE/ls.json"
 out=$(LILBOX_FZF_BIN="$STUB/fzf" shim manage)
 case $out in *"no boxes"*) ok "prints no-boxes message" ;; *) bad "prints no-boxes message (got: $out)" ;; esac
+teardown
+
+TEST=12 # hook reports the focused pane's box state to herdr
+setup
+name=$(cd "$ALIVE_DIR" && shim name)
+jq --arg n "$name" '.[0].name = $n' "$LILBOX_STUB_STATE/ls.json" >"$LILBOX_STUB_STATE/tmp" \
+	&& mv "$LILBOX_STUB_STATE/tmp" "$LILBOX_STUB_STATE/ls.json"
+HERDR_PANE_ID=w1:p1 HERDR_PLUGIN_ID=lilbox \
+	HERDR_PLUGIN_CONTEXT_JSON="{\"workspace_cwd\":\"$ALIVE_DIR\"}" shim hook
+assert_contains "$LILBOX_STUB_STATE/herdr-calls.log" \
+	"pane report-metadata w1:p1 --source lilbox --token lilbox=running" \
+	"reports running box as a \$lilbox token"
+teardown
+
+TEST=13 # hook reports none when the worktree has no box
+setup
+echo '[]' >"$LILBOX_STUB_STATE/ls.json"
+HERDR_PANE_ID=w1:p2 HERDR_PLUGIN_ID=lilbox \
+	HERDR_PLUGIN_CONTEXT_JSON="{\"workspace_cwd\":\"$ALIVE_DIR\"}" shim hook
+assert_contains "$LILBOX_STUB_STATE/herdr-calls.log" \
+	"pane report-metadata w1:p2 --source lilbox --token lilbox=none" \
+	"reports none for a boxless worktree"
+teardown
+
+TEST=14 # hook without herdr context exits 0 and reports nothing
+setup
+rc=0
+# Empty, not unset: this suite itself may run inside a herdr pane, where the
+# real HERDR_PANE_ID/CONTEXT_JSON would otherwise leak into the shim.
+HERDR_PANE_ID= HERDR_PLUGIN_ID= HERDR_PLUGIN_CONTEXT_JSON= shim hook || rc=$?
+assert_eq "$rc" "0" "exit 0 with no HERDR_PANE_ID"
+rc=0
+# Not through shim(): that helper pins HERDR_BIN_PATH to the stub, so a
+# missing-herdr case has to invoke the shim with a bare PATH directly.
+env PATH="/usr/bin:/bin" LILBOX_BIN=lilbox HERDR_BIN_PATH="$TMP/no-such-herdr" \
+	HERDR_PANE_ID=w1:p1 HERDR_PLUGIN_ID=lilbox \
+	HERDR_PLUGIN_CONTEXT_JSON="{\"workspace_cwd\":\"$ALIVE_DIR\"}" \
+	"$SHIM" hook || rc=$?
+assert_eq "$rc" "0" "exit 0 when the herdr binary is missing"
+[ ! -f "$LILBOX_STUB_STATE/herdr-calls.log" ] && ok "no metadata reported" ||
+	bad "no metadata reported (got: $(cat "$LILBOX_STUB_STATE/herdr-calls.log"))"
+teardown
+
+TEST=15 # hook --all reports every pane in the workspace
+setup
+name=$(cd "$ALIVE_DIR" && shim name)
+jq --arg n "$name" '.[0].name = $n' "$LILBOX_STUB_STATE/ls.json" >"$LILBOX_STUB_STATE/tmp" \
+	&& mv "$LILBOX_STUB_STATE/tmp" "$LILBOX_STUB_STATE/ls.json"
+cat >"$LILBOX_STUB_STATE/panes.json" <<EOF
+{"result":{"panes":[
+  {"pane_id":"w1:p1","cwd":"$ALIVE_DIR"},
+  {"pane_id":"w1:p2","cwd":"$GONE_DIR"}
+],"type":"pane_list"}}
+EOF
+HERDR_WORKSPACE_ID=w1 HERDR_PLUGIN_ID=lilbox shim hook --all
+assert_contains "$LILBOX_STUB_STATE/herdr-calls.log" \
+	"pane report-metadata w1:p1 --source lilbox --token lilbox=running" \
+	"reports the pane whose worktree has a running box"
+assert_contains "$LILBOX_STUB_STATE/herdr-calls.log" \
+	"pane report-metadata w1:p2 --source lilbox --token lilbox=none" \
+	"reports none for the boxless pane"
+teardown
+
+TEST=16 # hook passes a stopped box's status word through verbatim
+setup
+name=$(cd "$ALIVE_DIR" && shim name)
+jq --arg n "$name" '.[1].name = $n' "$LILBOX_STUB_STATE/ls.json" >"$LILBOX_STUB_STATE/tmp" \
+	&& mv "$LILBOX_STUB_STATE/tmp" "$LILBOX_STUB_STATE/ls.json"
+HERDR_PANE_ID=w1:p3 HERDR_PLUGIN_ID=lilbox \
+	HERDR_PLUGIN_CONTEXT_JSON="{\"workspace_cwd\":\"$ALIVE_DIR\"}" shim hook
+assert_contains "$LILBOX_STUB_STATE/herdr-calls.log" \
+	"pane report-metadata w1:p3 --source lilbox --token lilbox=stopped" \
+	"reports stopped for a stopped box"
+teardown
+
+TEST=17 # hook exits 0 without reporting when lilbox itself is missing
+setup
+rc=0
+# Not through shim(): that helper puts the stub lilbox on PATH, so the
+# missing-lilbox case runs the shim with only stub herdr available.
+env PATH="$STUB:/usr/bin:/bin" LILBOX_BIN=no-such-lilbox HERDR_BIN_PATH="$STUB/herdr" \
+	HERDR_PANE_ID=w1:p1 HERDR_PLUGIN_ID=lilbox \
+	HERDR_PLUGIN_CONTEXT_JSON="{\"workspace_cwd\":\"$ALIVE_DIR\"}" \
+	"$SHIM" hook || rc=$?
+assert_eq "$rc" "0" "exit 0 when the lilbox binary is missing"
+[ ! -f "$LILBOX_STUB_STATE/herdr-calls.log" ] && ok "no metadata reported" ||
+	bad "no metadata reported (got: $(cat "$LILBOX_STUB_STATE/herdr-calls.log"))"
+teardown
+
+TEST=18 # hook falls back to the event payload for the pane id
+setup
+name=$(cd "$ALIVE_DIR" && shim name)
+jq --arg n "$name" '.[0].name = $n' "$LILBOX_STUB_STATE/ls.json" >"$LILBOX_STUB_STATE/tmp" \
+	&& mv "$LILBOX_STUB_STATE/tmp" "$LILBOX_STUB_STATE/ls.json"
+HERDR_PANE_ID= HERDR_PLUGIN_ID=lilbox \
+	HERDR_PLUGIN_EVENT_JSON="{\"data\":{\"pane\":{\"pane_id\":\"w1:p9\"}}}" \
+	HERDR_PLUGIN_CONTEXT_JSON="{\"workspace_cwd\":\"$ALIVE_DIR\"}" shim hook
+assert_contains "$LILBOX_STUB_STATE/herdr-calls.log" \
+	"pane report-metadata w1:p9 --source lilbox --token lilbox=running" \
+	"pane id recovered from HERDR_PLUGIN_EVENT_JSON"
 teardown
 
 # --- summary ----------------------------------------------------------------

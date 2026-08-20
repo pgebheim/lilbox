@@ -25,6 +25,8 @@ usage: lilbox-herdr <command>
   kill        destroy the box and its home volume
   manage      fzf picker over every box: attach, stop, destroy, expose
   gc          destroy boxes whose worktree is gone (--dry-run to list)
+  hook        report this pane's box state as a $lilbox metadata token
+              (--all: every pane in the workspace; never fails)
   name        print the box name derived from this worktree
   open-url    open the box serving HERDR_PLUGIN_CLICKED_URL (link handler)
   teardown    destroy the box for the removed worktree (worktree.removed hook)
@@ -159,6 +161,54 @@ ensure_box() {
 attach() {
 	local name=$1 inner=$2
 	exec lilbox ssh "$name" -- sh -lc "cd $WORKDIR 2>/dev/null || true; $inner"
+}
+
+# --- pane metadata --------------------------------------------------------
+# herdr's pane.created/pane.focused events call `hook`, which reports the
+# pane's box state as a display-only `lilbox` token (see the README for the
+# sidebar row that surfaces it). Everything here is best-effort: no herdr, no
+# lilbox, no pane, no box — exit 0 either way, so a broken setup never takes
+# down the event hook.
+report_token() {
+	local bin=$1 pane_id=$2 path=$3 name status
+	name=$(box_name "$(canonical_path "$path")")
+	status=$(box_status "$name")
+	"$bin" pane report-metadata "$pane_id" \
+		--source lilbox --token "lilbox=${status:-none}" >/dev/null 2>&1 || true
+}
+
+cmd_hook() {
+	local bin pane_id path
+	bin=$(herdr_bin)
+	command -v "$bin" >/dev/null 2>&1 || exit 0
+	command -v "$LILBOX_BIN" >/dev/null 2>&1 || exit 0
+	# Without jq, box_status reads as empty and the token would report `none`
+	# for a running box — no token beats a wrong one.
+	command -v jq >/dev/null 2>&1 || exit 0
+	if [ "${1:-}" = "--all" ]; then
+		[ -n "${HERDR_WORKSPACE_ID:-}" ] || exit 0
+		"$bin" pane list --workspace "$HERDR_WORKSPACE_ID" 2>/dev/null |
+			jq -r '.result.panes[]? | [.pane_id, (.cwd // "")] | @tsv' 2>/dev/null |
+			while IFS=$'\t' read -r pane_id path; do
+				[ -n "$pane_id" ] && [ -n "$path" ] || continue
+				report_token "$bin" "$pane_id" "$path"
+			done || true
+		exit 0
+	fi
+	pane_id=${HERDR_PANE_ID:-}
+	# Event hooks get the pane id in the event payload when it's not in the
+	# environment (same fallback cmd_teardown uses for the worktree path).
+	if [ -z "$pane_id" ] && [ -n "${HERDR_PLUGIN_EVENT_JSON:-}" ]; then
+		pane_id=$(printf '%s' "$HERDR_PLUGIN_EVENT_JSON" | jq -r '
+			.data.pane.pane_id // .data.pane_id // .pane_id // empty
+		' 2>/dev/null) || pane_id=
+	fi
+	[ -n "$pane_id" ] || exit 0
+	# worktree_path dies when herdr gave no worktree; a hook reports nothing
+	# instead of failing.
+	path=$(worktree_path) || exit 0
+	report_token "$bin" "$pane_id" "$path"
+	exit 0
 }
 
 # --- link-click handoff -----------------------------------------------------
@@ -486,6 +536,7 @@ main() {
 	manage-rows) manage_rows ;;
 	manage-act) manage_act "$@" ;;
 	gc) cmd_gc "$@" ;;
+	hook) cmd_hook "$@" ;;
 	workspace-source) workspace_source "$@" ;;
 	name) cmd_name ;;
 	open-url) cmd_open_url ;;

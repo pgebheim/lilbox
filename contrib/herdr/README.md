@@ -16,7 +16,7 @@ worktree instead of shuttling snapshots, and costs nothing per hour.
 
 - Linux host with KVM — microsandbox boots libkrun microVMs (`lilbox doctor`)
 - `lilbox` on `PATH`
-- herdr **0.7.5+** (popup pane placement)
+- herdr **0.8.0+** (`pane report-metadata`; popup pane placement)
 - `jq` — herdr hands plugins their context as JSON
 - `fzf` — for the `lilbox.manage` box picker
 
@@ -222,6 +222,18 @@ the root README's [`lilbox-box`](../../images/lilbox-box/README.md) section.
 The agent needs credentials: `lilbox agent` injects `ANTHROPIC_API_KEY` from
 your environment as a scoped secret when it's set, so export it wherever the
 herdr server starts.
+
+## Sidebar badge
+
+The plugin reports each pane's box state as a `$lilbox` metadata token on
+`pane.created` and `pane.focused`. The value is whatever status word
+`lilbox ls` reports (`none` when the worktree has no box). Requires herdr ≥
+0.8.0. Surface it in a sidebar row:
+
+```toml
+# ~/.config/herdr/config.toml
+ui.sidebar.agents.rows = [["state_icon", "workspace", "tab"], ["agent", "$lilbox"]]
+```
 
 ## Running the shim directly
 
