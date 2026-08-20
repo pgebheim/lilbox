@@ -11,12 +11,14 @@ FROM alpine:3.20
 
 # tailscale ships both `tailscale` and `tailscaled` in one apk package.
 # iproute2 gives a real `ip` (busybox's lacks `tuntap`); ca-certificates for
-# TLS to the control plane; openssh for Tailscale SSH later (#6).
+# TLS to the control plane; openssh for Tailscale SSH later (#6); socat for
+# the unix→vsock herdr socket relay (#130).
 RUN apk add --no-cache \
       tailscale \
       iproute2 \
       ca-certificates \
-      openssh
+      openssh \
+      socat
 
 # State + runtime dirs tailscaled expects.
 RUN mkdir -p /var/lib/tailscale /var/run/tailscale
