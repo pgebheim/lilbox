@@ -97,6 +97,23 @@ async fn chmod_guest(sandbox: &Sandbox, path: &str, mode: u32) {
     }
 }
 
+/// Parse repeatable `--env KEY=VAL` pairs into exec env for the guest.
+/// `split_once` keeps any `=` in the value intact.
+fn parse_exec_env(pairs: &[String]) -> Result<Vec<(String, String)>> {
+    pairs
+        .iter()
+        .map(|pair| {
+            let (key, value) = pair
+                .split_once('=')
+                .ok_or_else(|| anyhow!("--env expects KEY=VAL, got '{pair}'"))?;
+            if key.is_empty() {
+                bail!("--env key must not be empty");
+            }
+            Ok((key.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
 /// Build the guest command that runs the agent task.
 /// When the herdr relay route is active (`relay_socket` is the mirrored guest
 /// path for the host's herdr socket), the script first spawns the unix→vsock
@@ -135,6 +152,7 @@ fn agent_launch_command(task: &str, relay_socket: Option<&std::path::Path>) -> V
 }
 
 pub(crate) async fn cmd_agent(app: &App, args: AgentArgs) -> Result<i32> {
+    let exec_env = parse_exec_env(&args.env)?;
     let name = match args.name {
         Some(name) => name,
         None => random_name(app)?,
@@ -324,7 +342,7 @@ pub(crate) async fn cmd_agent(app: &App, args: AgentArgs) -> Result<i32> {
     // path string as the guest-side path.
     let relay = herdr_vsock_route(herdr_socket_path_from_env()).map(|(path, _)| path);
     let command = agent_launch_command(&task, relay.as_deref());
-    run_guest(&sandbox, &command, Some(AGENT_WORKDIR)).await
+    run_guest(&sandbox, &command, Some(AGENT_WORKDIR), &exec_env).await
 }
 
 #[cfg(test)]
@@ -385,6 +403,30 @@ mod tests {
         // The guest shim and the host route must agree; pin the wire value.
         let cmd = agent_launch_command("t", Some(&PathBuf::from("/s")));
         assert!(cmd[2].contains("VSOCK-CONNECT:2:47100"));
+    }
+
+    #[test]
+    fn parse_exec_env_accepts_pairs_and_preserves_value_equals() {
+        let env = parse_exec_env(&[
+            "HERDR_PANE_ID=pane-42".to_string(),
+            "HERDR_ENV=1".to_string(),
+            "TOKEN=a=b=c".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            env,
+            vec![
+                ("HERDR_PANE_ID".to_string(), "pane-42".to_string()),
+                ("HERDR_ENV".to_string(), "1".to_string()),
+                ("TOKEN".to_string(), "a=b=c".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_exec_env_rejects_malformed_pairs() {
+        assert!(parse_exec_env(&["NOEQUALS".to_string()]).is_err());
+        assert!(parse_exec_env(&["=value".to_string()]).is_err());
     }
 
     #[tokio::test]

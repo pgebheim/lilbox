@@ -9,6 +9,10 @@ set -euo pipefail
 
 SHIM=$(realpath "$(dirname "$0")/../bin/lilbox-herdr")
 
+# Hermetic: the session running these tests may itself live under herdr, so
+# drop any ambient pane identity; tests that want it pass it inline per call.
+unset HERDR_ENV HERDR_SOCKET_PATH HERDR_PANE_ID HERDR_WORKSPACE_ID HERDR_TAB_ID
+
 PASS=0
 FAIL=0
 TEST=
@@ -350,6 +354,31 @@ HERDR_PANE_ID= HERDR_PLUGIN_ID=lilbox \
 assert_contains "$LILBOX_STUB_STATE/herdr-calls.log" \
 	"pane report-metadata w1:p9 --source lilbox --token lilbox=running" \
 	"pane id recovered from HERDR_PLUGIN_EVENT_JSON"
+teardown
+
+TEST=19 # agent action forwards the pane's herdr identity into the box
+setup
+HERDR_ENV=1 HERDR_SOCKET_PATH=/tmp/herdr-test.sock HERDR_PANE_ID=pane-42 \
+	HERDR_WORKSPACE_ID=ws-7 HERDR_TAB_ID=tab-3 \
+	HERDR_PLUGIN_CONTEXT_JSON="{\"worktree\":{\"checkout_path\":\"$ALIVE_DIR\"}}" shim agent
+calls=$(cat "$LILBOX_STUB_STATE/calls.log")
+case $calls in *"agent "*"--env HERDR_PANE_ID=pane-42"*) ok "lilbox agent gets --env HERDR_PANE_ID" ;; *) bad "lilbox agent gets --env HERDR_PANE_ID (got: $calls)" ;; esac
+case $calls in *"--env HERDR_SOCKET_PATH=/tmp/herdr-test.sock"*) ok "lilbox agent gets --env HERDR_SOCKET_PATH" ;; *) bad "lilbox agent gets --env HERDR_SOCKET_PATH (got: $calls)" ;; esac
+case $calls in *"--env HERDR_WORKSPACE_ID=ws-7"*"--env HERDR_TAB_ID=tab-3"*) ok "lilbox agent gets workspace+tab ids" ;; *) bad "lilbox agent gets workspace+tab ids (got: $calls)" ;; esac
+case $calls in *"--env HERDR_ENV=1"*) ok "lilbox agent gets HERDR_ENV=1" ;; *) bad "lilbox agent gets HERDR_ENV=1 (got: $calls)" ;; esac
+case $calls in *HERDR_BIN_PATH*) bad "HERDR_BIN_PATH never forwarded (host path, invalid in guest)" ;; *) ok "HERDR_BIN_PATH never forwarded (host path, invalid in guest)" ;; esac
+case $calls in *ssh*export*HERDR_PANE_ID=pane-42*"exec claude"*) ok "attach path exports identity for the guest agent" ;; *) bad "attach path exports identity for the guest agent (got: $calls)" ;; esac
+case $calls in *ssh*"VSOCK-CONNECT:2:47100"*) ok "attach path starts the unix->vsock relay listener" ;; *) bad "attach path starts the unix->vsock relay listener (got: $calls)" ;; esac
+teardown
+
+TEST=20 # agent action forwards nothing when not running under herdr
+setup
+HERDR_PLUGIN_CONTEXT_JSON="{\"worktree\":{\"checkout_path\":\"$ALIVE_DIR\"}}" shim agent
+calls=$(cat "$LILBOX_STUB_STATE/calls.log")
+case $calls in *"--env"*) bad "no --env without HERDR_ENV (got: $calls)" ;; *) ok "no --env without HERDR_ENV" ;; esac
+case $calls in *"export HERDR"*) bad "no identity export without HERDR_ENV (got: $calls)" ;; *) ok "no identity export without HERDR_ENV" ;; esac
+case $calls in *VSOCK-CONNECT*) bad "no relay listener without HERDR_SOCKET_PATH" ;; *) ok "no relay listener without HERDR_SOCKET_PATH" ;; esac
+case $calls in *ssh*"; exec claude"*) ok "attach still execs the agent" ;; *) bad "attach still execs the agent (got: $calls)" ;; esac
 teardown
 
 # --- summary ----------------------------------------------------------------

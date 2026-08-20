@@ -154,6 +154,15 @@ blocked / done / idle) reads. The agent edits your actual worktree files —
 `/workspace` is a bind mount, not a copy, so there's no sync step in either
 direction.
 
+The pane's herdr identity (`HERDR_SOCKET_PATH`, `HERDR_PANE_ID`,
+`HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`) is forwarded into the guest — at
+provision as transient `lilbox agent --env` pairs, at attach as exports in the
+remote command — so the in-box agent's herdr hook attributes state to the right
+pane. When a herdr socket is known, the pane also brings up the guest's
+unix→vsock relay listener for it (the pane flow provisions without a task,
+which never starts one). `HERDR_BIN_PATH` is never forwarded: it's a host path,
+meaningless inside the box.
+
 Ctrl+click a published `*.ts.net` URL in any pane to shell into the box serving
 it.
 

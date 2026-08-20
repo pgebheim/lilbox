@@ -65,10 +65,13 @@ pub(crate) async fn connect_box(app: &App, name: &str, auto_resume: bool) -> Res
     }
 }
 
+/// `exec_env` is transient: applied to this exec/attach call only, never
+/// written into the sandbox's persisted config.
 pub(crate) async fn run_guest(
     sandbox: &Sandbox,
     command: &[String],
     cwd: Option<&str>,
+    exec_env: &[(String, String)],
 ) -> Result<i32> {
     if command.is_empty() {
         bail!("nothing to run");
@@ -80,6 +83,9 @@ pub(crate) async fn run_guest(
         return Ok(sandbox
             .attach_with(cmd, |a| {
                 let a = a.args(args.iter().cloned());
+                let a = exec_env
+                    .iter()
+                    .fold(a, |a, (k, v)| a.env(k.as_str(), v.as_str()));
                 if let Some(cwd) = cwd { a.cwd(cwd) } else { a }
             })
             .await?);
@@ -87,6 +93,9 @@ pub(crate) async fn run_guest(
     let mut handle = sandbox
         .exec_stream_with(cmd, |e| {
             let e = e.args(args.iter().cloned());
+            let e = exec_env
+                .iter()
+                .fold(e, |e, (k, v)| e.env(k.as_str(), v.as_str()));
             let e = if stdin_is_terminal {
                 e.stdin_null()
             } else {
@@ -181,7 +190,13 @@ pub(crate) async fn exec(app: &App, args: ExecArgs) -> Result<i32> {
     if args.cmd.is_empty() {
         bail!("nothing to run - usage: lilbox exec NAME -- <cmd>");
     }
-    run_guest(&connect_box(app, &args.name, true).await?, &args.cmd, None).await
+    run_guest(
+        &connect_box(app, &args.name, true).await?,
+        &args.cmd,
+        None,
+        &[],
+    )
+    .await
 }
 
 pub(crate) async fn ssh(app: &App, args: ExecArgs) -> Result<i32> {
@@ -198,7 +213,7 @@ pub(crate) async fn ssh(app: &App, args: ExecArgs) -> Result<i32> {
     if args.cmd.is_empty() {
         return Ok(sandbox.attach_shell().await?);
     }
-    run_guest(&sandbox, &args.cmd, None).await
+    run_guest(&sandbox, &args.cmd, None, &[]).await
 }
 
 pub(crate) async fn run(app: &App, args: RunArgs) -> Result<i32> {
@@ -213,7 +228,7 @@ pub(crate) async fn run(app: &App, args: RunArgs) -> Result<i32> {
     let code = if args.cmd.is_empty() {
         sandbox.attach_shell().await?
     } else {
-        run_guest(&sandbox, &args.cmd, None).await?
+        run_guest(&sandbox, &args.cmd, None, &[]).await?
     };
     sandbox.stop().await?;
     Ok(code)
