@@ -261,3 +261,10 @@ would quietly box up the plugin's own source tree.
 herdr plugins run as your user with your environment. This one shells out to
 `lilbox` and `jq` and calls back into herdr through `HERDR_BIN_PATH`; it is a
 manifest and one script, and reading them is the intended way to vet it.
+
+When a box is opened through herdr, the guest receives access to the host's
+herdr control socket over vsock — unauthenticated, loopback-equivalent trust —
+and agent boxes run with `--dangerously-skip-permissions`. Only open boxes for
+repos and agents you would trust with your herdr instance. Boxes created
+outside herdr (plain `lilbox new`/`lilbox agent` on the command line) get no
+route and cannot reach the socket.
