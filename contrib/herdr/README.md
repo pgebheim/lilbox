@@ -225,9 +225,10 @@ herdr server starts.
 
 ## Sidebar badge
 
-The plugin reports each pane's box state as a `$lilbox` metadata token
-(`running` / `stopped` / `none`) on `pane.created` and `pane.focused`. Surface
-it in a sidebar row:
+The plugin reports each pane's box state as a `$lilbox` metadata token on
+`pane.created` and `pane.focused`. The value is whatever status word
+`lilbox ls` reports (`none` when the worktree has no box). Requires herdr ≥
+0.8.0. Surface it in a sidebar row:
 
 ```toml
 # ~/.config/herdr/config.toml

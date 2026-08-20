@@ -182,10 +182,13 @@ cmd_hook() {
 	bin=$(herdr_bin)
 	command -v "$bin" >/dev/null 2>&1 || exit 0
 	command -v "$LILBOX_BIN" >/dev/null 2>&1 || exit 0
+	# Without jq, box_status reads as empty and the token would report `none`
+	# for a running box — no token beats a wrong one.
+	command -v jq >/dev/null 2>&1 || exit 0
 	if [ "${1:-}" = "--all" ]; then
 		[ -n "${HERDR_WORKSPACE_ID:-}" ] || exit 0
 		"$bin" pane list --workspace "$HERDR_WORKSPACE_ID" 2>/dev/null |
-			jq -r '.result.panes[]? | [.pane_id, .cwd] | @tsv' 2>/dev/null |
+			jq -r '.result.panes[]? | [.pane_id, (.cwd // "")] | @tsv' 2>/dev/null |
 			while IFS=$'\t' read -r pane_id path; do
 				[ -n "$pane_id" ] && [ -n "$path" ] || continue
 				report_token "$bin" "$pane_id" "$path"
@@ -193,6 +196,13 @@ cmd_hook() {
 		exit 0
 	fi
 	pane_id=${HERDR_PANE_ID:-}
+	# Event hooks get the pane id in the event payload when it's not in the
+	# environment (same fallback cmd_teardown uses for the worktree path).
+	if [ -z "$pane_id" ] && [ -n "${HERDR_PLUGIN_EVENT_JSON:-}" ]; then
+		pane_id=$(printf '%s' "$HERDR_PLUGIN_EVENT_JSON" | jq -r '
+			.data.pane.pane_id // .data.pane_id // .pane_id // empty
+		' 2>/dev/null) || pane_id=
+	fi
 	[ -n "$pane_id" ] || exit 0
 	# worktree_path dies when herdr gave no worktree; a hook reports nothing
 	# instead of failing.

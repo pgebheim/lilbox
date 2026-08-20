@@ -10,7 +10,7 @@
 id = "lilbox"
 name = "lilbox"
 version = "0.1.0"
-min_herdr_version = "0.7.5"
+min_herdr_version = "0.8.0"
 platforms = ["linux"]                 # microsandbox needs KVM
 description = "Run agents in libkrun microVMs on your own hardware: one lilbox per worktree, torn down with it."
 
