@@ -10,7 +10,9 @@ use serde_json::Value;
 
 use crate::app::App;
 use crate::cli::AgentArgs;
-use crate::sandbox::{run_guest, stop_and_remove, with_secret_env};
+use crate::sandbox::{
+    herdr_socket_path_from_env, run_guest, stop_and_remove, with_herdr_vsock, with_secret_env,
+};
 use crate::util::{DEFAULT_GUEST_PORT, alloc_host_port, find_program, or_cleanup, random_name};
 
 const AGENT_WORKDIR: &str = "/workspace";
@@ -132,7 +134,7 @@ pub(crate) async fn cmd_agent(app: &App, args: AgentArgs) -> Result<i32> {
         bail!("workspace not found: {}", workspace.display());
     }
     let host_port = alloc_host_port()?;
-    let mut builder = Sandbox::builder(&name)
+    let builder = Sandbox::builder(&name)
         .image(args.image.as_str())
         .port(host_port, DEFAULT_GUEST_PORT)
         .workdir(AGENT_WORKDIR)
@@ -140,6 +142,7 @@ pub(crate) async fn cmd_agent(app: &App, args: AgentArgs) -> Result<i32> {
         .detached(true)
         .label("dev.lilbox.managed", "true")
         .label("dev.lilbox.kind", "agent");
+    let mut builder = with_herdr_vsock(builder, herdr_socket_path_from_env());
     let claude_paths = host_claude_paths(dirs::home_dir()).ok();
     let creds_src = claude_paths
         .as_ref()
