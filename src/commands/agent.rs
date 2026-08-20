@@ -116,8 +116,9 @@ fn agent_launch_command(task: &str, relay_socket: Option<&std::path::Path>) -> V
     };
     let script = format!(
         "HERDR_SOCKET_PATH=$1; export HERDR_SOCKET_PATH; \
+         mkdir -p \"${{HERDR_SOCKET_PATH%/*}}\"; \
          if command -v socat >/dev/null 2>&1; then \
-         socat \"UNIX-LISTEN:$HERDR_SOCKET_PATH,fork,reuseaddr\" \"VSOCK-CONNECT:2:{HERDR_VSOCK_PORT}\" >/dev/null 2>&1 & \
+         socat \"UNIX-LISTEN:$HERDR_SOCKET_PATH,fork,reuseaddr\" \"VSOCK-CONNECT:2:{HERDR_VSOCK_PORT}\" >/dev/null & \
          else echo \"warning: socat missing in guest; agent runs without the herdr relay\" >&2; fi; \
          IS_SANDBOX=1 exec claude -p \"$2\" --dangerously-skip-permissions"
     );
@@ -357,8 +358,15 @@ mod tests {
         let script = &cmd[2];
         assert!(script.contains("HERDR_SOCKET_PATH=$1"));
         assert!(script.contains("export HERDR_SOCKET_PATH"));
+        // Fresh guests lack the host path's parent dir; the bind needs it.
+        assert!(script.contains("mkdir -p \"${HERDR_SOCKET_PATH%/*}\""));
         assert!(script.contains("UNIX-LISTEN:$HERDR_SOCKET_PATH,fork,reuseaddr"));
         assert!(script.contains(&format!("VSOCK-CONNECT:2:{HERDR_VSOCK_PORT}")));
+        // socat stdout is quiet but stderr survives for diagnostics.
+        assert!(script.contains(&format!(
+            "VSOCK-CONNECT:2:{HERDR_VSOCK_PORT}\" >/dev/null &"
+        )));
+        assert!(!script.contains(">/dev/null 2>&1 &"));
         // socat failure must never break the launch.
         assert!(script.contains("command -v socat"));
         assert!(script.contains("warning:"));
