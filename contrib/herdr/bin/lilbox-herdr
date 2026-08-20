@@ -95,7 +95,7 @@ agent_inner() {
 	[ ${#exports[@]} -gt 0 ] && prefix="export ${exports[*]}; "
 	local inner="${prefix}exec $LILBOX_AGENT_CMD"
 	if [ -n "${HERDR_SOCKET_PATH:-}" ]; then
-		inner='[ -S "$HERDR_SOCKET_PATH" ] || { mkdir -p "${HERDR_SOCKET_PATH%/*}" && socat "UNIX-LISTEN:$HERDR_SOCKET_PATH,fork,reuseaddr" "VSOCK-CONNECT:2:47100" >/dev/null 2>&1 & }; '"$inner"
+		inner='[ -S "$HERDR_SOCKET_PATH" ] || { mkdir -p "${HERDR_SOCKET_PATH%/*}" && socat "UNIX-LISTEN:$HERDR_SOCKET_PATH,fork,reuseaddr" "VSOCK-CONNECT:2:47100" >/dev/null & }; '"$inner"
 	fi
 	printf '%s' "$inner"
 }

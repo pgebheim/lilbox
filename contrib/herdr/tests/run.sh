@@ -381,6 +381,20 @@ case $calls in *VSOCK-CONNECT*) bad "no relay listener without HERDR_SOCKET_PATH
 case $calls in *ssh*"; exec claude"*) ok "attach still execs the agent" ;; *) bad "attach still execs the agent (got: $calls)" ;; esac
 teardown
 
+TEST=21 # identity values with spaces survive %q quoting without splitting
+setup
+HERDR_ENV=1 HERDR_PANE_ID='pane 42' \
+	HERDR_PLUGIN_CONTEXT_JSON="{\"worktree\":{\"checkout_path\":\"$ALIVE_DIR\"}}" shim agent
+calls=$(cat "$LILBOX_STUB_STATE/calls.log")
+# %q escapes the space, so the export round-trips as one word; an unquoted
+# value would split into `HERDR_PANE_ID=pane` + a stray `42` token. Check the
+# attach (ssh) line only: the provision `--env` pair is argv, where a raw
+# space is legitimate.
+ssh_line=$(grep '^ssh ' "$LILBOX_STUB_STATE/calls.log")
+case $ssh_line in *"HERDR_PANE_ID=pane\\ 42"*) ok "space escaped as one shell word" ;; *) bad "space escaped as one shell word (got: $ssh_line)" ;; esac
+case $ssh_line in *"HERDR_PANE_ID=pane 42"*) bad "unescaped space would split the export" ;; *) ok "unescaped space would split the export" ;; esac
+teardown
+
 # --- summary ----------------------------------------------------------------
 echo
 if [ "$FAIL" -gt 0 ]; then

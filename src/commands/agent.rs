@@ -106,8 +106,17 @@ fn parse_exec_env(pairs: &[String]) -> Result<Vec<(String, String)>> {
             let (key, value) = pair
                 .split_once('=')
                 .ok_or_else(|| anyhow!("--env expects KEY=VAL, got '{pair}'"))?;
-            if key.is_empty() {
-                bail!("--env key must not be empty");
+            // Fail fast on anything that isn't a valid shell identifier — a
+            // bad key would fail opaquely in the guest otherwise.
+            let valid = !key.is_empty()
+                && key.chars().enumerate().all(|(i, c)| {
+                    c == '_'
+                        || c.is_ascii_uppercase()
+                        || c.is_ascii_lowercase()
+                        || (i > 0 && c.is_ascii_digit())
+                });
+            if !valid {
+                bail!("--env key '{key}' is not a valid name ([A-Za-z_][A-Za-z0-9_]*)");
             }
             Ok((key.to_owned(), value.to_owned()))
         })
@@ -427,6 +436,14 @@ mod tests {
     fn parse_exec_env_rejects_malformed_pairs() {
         assert!(parse_exec_env(&["NOEQUALS".to_string()]).is_err());
         assert!(parse_exec_env(&["=value".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_exec_env_rejects_invalid_key_names() {
+        assert!(parse_exec_env(&["1ST=x".to_string()]).is_err());
+        assert!(parse_exec_env(&["MY-KEY=x".to_string()]).is_err());
+        assert!(parse_exec_env(&["MY KEY=x".to_string()]).is_err());
+        assert!(parse_exec_env(&["_OK_9=x".to_string()]).is_ok());
     }
 
     #[tokio::test]
