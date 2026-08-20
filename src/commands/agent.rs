@@ -11,7 +11,8 @@ use serde_json::Value;
 use crate::app::App;
 use crate::cli::AgentArgs;
 use crate::sandbox::{
-    herdr_socket_path_from_env, run_guest, stop_and_remove, with_herdr_vsock, with_secret_env,
+    HERDR_VSOCK_PORT, herdr_socket_path_from_env, herdr_vsock_route, run_guest, stop_and_remove,
+    with_herdr_vsock, with_secret_env,
 };
 use crate::util::{DEFAULT_GUEST_PORT, alloc_host_port, find_program, or_cleanup, random_name};
 
@@ -94,6 +95,42 @@ async fn chmod_guest(sandbox: &Sandbox, path: &str, mode: u32) {
     if let Err(err) = sandbox.fs().set_stat(path, true, attrs).await {
         eprintln!("warning: could not set mode {mode:o} on {path} in agent box: {err}");
     }
+}
+
+/// Build the guest command that runs the agent task.
+/// When the herdr relay route is active (`relay_socket` is the mirrored guest
+/// path for the host's herdr socket), the script first spawns the unix→vsock
+/// socat listener and exports HERDR_SOCKET_PATH so the in-box agent's herdr
+/// hook works unchanged (spike #127). socat is best-effort: a guest without
+/// it warns on stderr and the agent launches without the relay. When the
+/// route is inactive the historical command is returned unchanged.
+fn agent_launch_command(task: &str, relay_socket: Option<&std::path::Path>) -> Vec<String> {
+    let Some(sock) = relay_socket else {
+        return vec![
+            "sh".into(),
+            "-c".into(),
+            "IS_SANDBOX=1 exec claude -p \"$1\" --dangerously-skip-permissions".into(),
+            "sh".into(),
+            task.into(),
+        ];
+    };
+    let script = format!(
+        "HERDR_SOCKET_PATH=$1; export HERDR_SOCKET_PATH; \
+         if command -v socat >/dev/null 2>&1; then \
+         socat \"UNIX-LISTEN:$HERDR_SOCKET_PATH,fork,reuseaddr\" \"VSOCK-CONNECT:2:{HERDR_VSOCK_PORT}\" >/dev/null 2>&1 & \
+         else echo \"warning: socat missing in guest; agent runs without the herdr relay\" >&2; fi; \
+         IS_SANDBOX=1 exec claude -p \"$2\" --dangerously-skip-permissions"
+    );
+    // Socket path and task travel as positional args, so host paths with
+    // spaces or shell metacharacters never need quoting into the script.
+    vec![
+        "sh".into(),
+        "-c".into(),
+        script,
+        "sh".into(),
+        sock.to_string_lossy().into_owned(),
+        task.into(),
+    ]
 }
 
 pub(crate) async fn cmd_agent(app: &App, args: AgentArgs) -> Result<i32> {
@@ -281,19 +318,66 @@ pub(crate) async fn cmd_agent(app: &App, args: AgentArgs) -> Result<i32> {
         return Ok(0);
     }
     let task = args.task.join(" ");
-    let command = vec![
-        "sh".into(),
-        "-c".into(),
-        "IS_SANDBOX=1 exec claude -p \"$1\" --dangerously-skip-permissions".into(),
-        "sh".into(),
-        task,
-    ];
+    // Same gate the builder used: route active iff HERDR_SOCKET_PATH is set
+    // and a live socket. #131's shim sets it explicitly; default to the host
+    // path string as the guest-side path.
+    let relay = herdr_vsock_route(herdr_socket_path_from_env()).map(|(path, _)| path);
+    let command = agent_launch_command(&task, relay.as_deref());
     run_guest(&sandbox, &command, Some(AGENT_WORKDIR)).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::HERDR_VSOCK_PORT;
+
+    #[test]
+    fn launch_command_without_relay_is_the_historical_command() {
+        // Invariant: route inactive -> byte-identical to pre-relay behavior.
+        let cmd = agent_launch_command("fix the bug", None);
+        assert_eq!(
+            cmd,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "IS_SANDBOX=1 exec claude -p \"$1\" --dangerously-skip-permissions".to_string(),
+                "sh".to_string(),
+                "fix the bug".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_command_with_relay_starts_socat_and_exports_socket_path() {
+        let sock = PathBuf::from("/home/u/.config/herdr/herdr.sock");
+        let cmd = agent_launch_command("fix the bug", Some(&sock));
+
+        assert_eq!(cmd[0], "sh");
+        assert_eq!(cmd[1], "-c");
+        let script = &cmd[2];
+        assert!(script.contains("HERDR_SOCKET_PATH=$1"));
+        assert!(script.contains("export HERDR_SOCKET_PATH"));
+        assert!(script.contains("UNIX-LISTEN:$HERDR_SOCKET_PATH,fork,reuseaddr"));
+        assert!(script.contains(&format!("VSOCK-CONNECT:2:{HERDR_VSOCK_PORT}")));
+        // socat failure must never break the launch.
+        assert!(script.contains("command -v socat"));
+        assert!(script.contains("warning:"));
+        // The agent still execs last, with the task as $2.
+        assert!(
+            script.ends_with("IS_SANDBOX=1 exec claude -p \"$2\" --dangerously-skip-permissions")
+        );
+        // Socket path and task travel as positional args (no shell quoting of host paths).
+        assert_eq!(cmd[3], "sh");
+        assert_eq!(cmd[4], sock.to_string_lossy());
+        assert_eq!(cmd[5], "fix the bug");
+    }
+
+    #[test]
+    fn launch_command_pins_vsock_port_literal() {
+        // The guest shim and the host route must agree; pin the wire value.
+        let cmd = agent_launch_command("t", Some(&PathBuf::from("/s")));
+        assert!(cmd[2].contains("VSOCK-CONNECT:2:47100"));
+    }
 
     #[tokio::test]
     async fn agent_secret_is_stored_as_an_environment_reference() {
